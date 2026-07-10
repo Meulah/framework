@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Meulah\Http;
 
+use InvalidArgumentException;
+
 final class Response
 {
     public function __construct(
@@ -11,6 +13,19 @@ final class Response
         private readonly int $status = 200,
         private readonly array $headers = [],
     ) {
+        if ($this->status < 100 || $this->status > 599) {
+            throw new InvalidArgumentException("Invalid HTTP status code: {$this->status}");
+        }
+
+        foreach ($this->headers as $name => $value) {
+            if (!is_string($name) || preg_match("/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/", $name) !== 1) {
+                throw new InvalidArgumentException('Invalid HTTP header name.');
+            }
+
+            if (!is_string($value) || str_contains($value, "\r") || str_contains($value, "\n")) {
+                throw new InvalidArgumentException("Invalid value for HTTP header: {$name}");
+            }
+        }
     }
 
     public static function html(string $content, int $status = 200): self
@@ -38,6 +53,11 @@ final class Response
         return $this->headers;
     }
 
+    public function withoutBody(): self
+    {
+        return new self('', $this->status, $this->headers);
+    }
+
     public function send(): void
     {
         http_response_code($this->status);
@@ -49,4 +69,3 @@ final class Response
         echo $this->content;
     }
 }
-

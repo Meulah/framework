@@ -14,6 +14,7 @@ use Meulah\Log\Logger;
 use Meulah\Routing\MethodNotAllowed;
 use Meulah\Routing\RouteNotFound;
 use Meulah\Routing\Router;
+use Meulah\Support\Environment;
 use Meulah\View\View;
 
 require __DIR__ . '/bootstrap.php';
@@ -35,12 +36,33 @@ $assertSame = static function (mixed $expected, mixed $actual): void {
 };
 
 $test('request exposes normalized input', static function () use ($assertSame): void {
-    $request = new Request('POST', '/users/login', ['page' => '2'], ['email' => 'dev@example.com']);
+    $request = new Request('post', '/users/login/', ['page' => '2'], ['email' => 'dev@example.com']);
 
     $assertSame('POST', $request->method());
     $assertSame('/users/login', $request->path());
     $assertSame('2', $request->query('page'));
     $assertSame('dev@example.com', $request->input('email'));
+});
+
+$test('captured requests hide the internal rewrite parameter', static function () use ($assertSame): void {
+    $originalGet = $_GET;
+    $originalPost = $_POST;
+    $originalServer = $_SERVER;
+
+    try {
+        $_GET = ['url' => 'articles/42', 'page' => '2'];
+        $_POST = [];
+        $_SERVER['REQUEST_METHOD'] = 'GET';
+        $request = Request::capture();
+
+        $assertSame('/articles/42', $request->path());
+        $assertSame('2', $request->query('page'));
+        $assertSame(null, $request->query('url'));
+    } finally {
+        $_GET = $originalGet;
+        $_POST = $originalPost;
+        $_SERVER = $originalServer;
+    }
 });
 
 $test('router dispatches static routes', static function () use ($assertSame): void {
@@ -92,6 +114,32 @@ $test('application converts routing failures into HTTP responses', static functi
     $assertSame(404, $notFound->status());
 });
 
+$test('HEAD responses never include a body', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->get('/health', static fn (): string => 'healthy');
+    $application = new Application($router);
+
+    $response = $application->handle(new Request('HEAD', '/health'));
+
+    $assertSame(200, $response->status());
+    $assertSame('', $response->content());
+    $assertSame('text/html; charset=UTF-8', $response->headers()['Content-Type']);
+});
+
+$test('responses reject invalid status codes and headers early', static function (): void {
+    try {
+        new Response('', 700);
+        throw new RuntimeException('Expected invalid status rejection.');
+    } catch (InvalidArgumentException) {
+    }
+
+    try {
+        new Response('', 200, ['Location' => "/safe\r\nX-Injected: yes"]);
+        throw new RuntimeException('Expected invalid header rejection.');
+    } catch (InvalidArgumentException) {
+    }
+});
+
 $test('configuration supports nested values and strict types', static function () use ($assertSame): void {
     $config = new Repository([
         'app' => ['environment' => 'testing', 'debug' => true],
@@ -110,6 +158,23 @@ $test('configuration loads root configuration files', static function () use ($a
 
     $assertSame(true, $config->has('app.environment'));
     $assertSame('mysql', $config->string('database.driver'));
+});
+
+$test('environment reads server values before defaults', static function () use ($assertSame): void {
+    $key = 'MEULAH_TEST_ENVIRONMENT_VALUE';
+    $original = $_SERVER[$key] ?? null;
+    $existed = array_key_exists($key, $_SERVER);
+
+    try {
+        $_SERVER[$key] = 'from-server';
+        $assertSame('from-server', Environment::get($key, 'fallback'));
+    } finally {
+        if ($existed) {
+            $_SERVER[$key] = $original;
+        } else {
+            unset($_SERVER[$key]);
+        }
+    }
 });
 
 $test('exception handler hides production details and logs failures', static function () use ($assertSame): void {

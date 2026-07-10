@@ -21,10 +21,24 @@ final class Environment
         }
 
         foreach ($values as $key => $value) {
-            if (!array_key_exists($key, $_ENV)) {
+            if (!array_key_exists($key, $_ENV) && !array_key_exists($key, $_SERVER) && getenv($key) === false) {
                 $_ENV[$key] = $value;
             }
         }
     }
-}
 
+    public static function get(string $key, mixed $default = null): mixed
+    {
+        if (array_key_exists($key, $_ENV)) {
+            return $_ENV[$key];
+        }
+
+        if (array_key_exists($key, $_SERVER)) {
+            return $_SERVER[$key];
+        }
+
+        $value = getenv($key);
+
+        return $value === false ? $default : $value;
+    }
+}

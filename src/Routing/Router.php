@@ -6,7 +6,6 @@ namespace Meulah\Routing;
 
 use InvalidArgumentException;
 use Meulah\Http\Request;
-use Meulah\Http\Response;
 
 final class Router
 {
@@ -45,11 +44,7 @@ final class Router
             }
 
             $handler = $this->resolveHandler($route->handler);
-            $result = $handler(...array_values($parameters));
-
-            return $request->method() === 'HEAD' && $result instanceof Response
-                ? new Response('', $result->status(), $result->headers())
-                : $result;
+            return $handler(...array_values($parameters));
         }
 
         if ($allowed !== []) {
@@ -110,4 +105,3 @@ final class Router
         return $handler;
     }
 }
-

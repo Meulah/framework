@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Meulah\Http\Request;
+
 $root = dirname(__DIR__);
 $autoloader = $root . '/vendor/autoload.php';
 

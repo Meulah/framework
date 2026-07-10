@@ -42,7 +42,7 @@ final class Application
         try {
             $result = $this->router->dispatch($request);
 
-            return match (true) {
+            $response = match (true) {
                 $result instanceof Response => $result,
                 is_string($result) => Response::html($result),
                 $result === null => new Response(),
@@ -50,6 +50,8 @@ final class Application
                     'Route handlers must return a Response, string, or null.',
                 ),
             };
+
+            return $request->method() === 'HEAD' ? $response->withoutBody() : $response;
         } catch (Throwable $exception) {
             return $this->exceptions->render($exception);
         }
