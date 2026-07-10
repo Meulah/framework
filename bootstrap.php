@@ -3,15 +3,22 @@
 declare(strict_types=1);
 
 use Meulah\Application;
+use Meulah\Config\Repository;
+use Meulah\Exception\ExceptionHandler;
+use Meulah\Log\ErrorLogLogger;
 use Meulah\Routing\Router;
 use Meulah\Support\Environment;
 
 Environment::load(__DIR__ . '/.env');
 
-$config = require __DIR__ . '/config/app.php';
+$config = Repository::load(__DIR__ . '/config');
+$debug = $config->bool('app.debug');
 
 error_reporting(E_ALL);
-ini_set('display_errors', $config['debug'] ? '1' : '0');
+ini_set('display_errors', $debug ? '1' : '0');
 
-return new Application(new Router(), $config['debug']);
-
+return new Application(
+    new Router(),
+    $config,
+    new ExceptionHandler($debug, new ErrorLogLogger()),
+);

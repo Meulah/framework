@@ -3,11 +3,14 @@
 declare(strict_types=1);
 
 use Meulah\Application;
+use Meulah\Config\Repository;
 use Meulah\Database\Connection;
 use Meulah\Database\Migration;
 use Meulah\Database\Migrator;
+use Meulah\Exception\ExceptionHandler;
 use Meulah\Http\Request;
 use Meulah\Http\Response;
+use Meulah\Log\Logger;
 use Meulah\Routing\MethodNotAllowed;
 use Meulah\Routing\RouteNotFound;
 use Meulah\Routing\Router;
@@ -87,6 +90,56 @@ $test('application converts routing failures into HTTP responses', static functi
     $assertSame(405, $notAllowed->status());
     $assertSame('POST', $notAllowed->headers()['Allow']);
     $assertSame(404, $notFound->status());
+});
+
+$test('configuration supports nested values and strict types', static function () use ($assertSame): void {
+    $config = new Repository([
+        'app' => ['environment' => 'testing', 'debug' => true],
+        'database' => ['port' => 3306],
+    ]);
+
+    $assertSame(true, $config->has('app.debug'));
+    $assertSame('testing', $config->string('app.environment'));
+    $assertSame(true, $config->bool('app.debug'));
+    $assertSame(3306, $config->int('database.port'));
+    $assertSame('fallback', $config->get('missing', 'fallback'));
+});
+
+$test('configuration loads root configuration files', static function () use ($assertSame): void {
+    $config = Repository::load(dirname(__DIR__) . '/config');
+
+    $assertSame(true, $config->has('app.environment'));
+    $assertSame('mysql', $config->string('database.driver'));
+});
+
+$test('exception handler hides production details and logs failures', static function () use ($assertSame): void {
+    $logger = new class implements Logger {
+        public array $exceptions = [];
+
+        public function error(Throwable $exception): void
+        {
+            $this->exceptions[] = $exception;
+        }
+    };
+    $handler = new ExceptionHandler(false, $logger);
+    $response = $handler->render(new RuntimeException('database password leaked'));
+
+    $assertSame(500, $response->status());
+    $assertSame(false, str_contains($response->content(), 'database password leaked'));
+    $assertSame(1, count($logger->exceptions));
+});
+
+$test('debug exceptions are escaped before rendering', static function () use ($assertSame): void {
+    $logger = new class implements Logger {
+        public function error(Throwable $exception): void
+        {
+        }
+    };
+    $handler = new ExceptionHandler(true, $logger);
+    $response = $handler->render(new RuntimeException('<script>alert(1)</script>'));
+
+    $assertSame(false, str_contains($response->content(), '<script>'));
+    $assertSame(true, str_contains($response->content(), '&lt;script&gt;'));
 });
 
 $test('view renderer isolates rendering behind a configured path', static function () use ($assertSame): void {
