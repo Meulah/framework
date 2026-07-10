@@ -1,17 +1,20 @@
 <?php
 
-// Require Composer autoloader if available
-$vendorAutoload = '../app/helpers/vendor/autoload.php';
-if (file_exists($vendorAutoload)) {
-    require_once $vendorAutoload;
+declare(strict_types=1);
+
+use Meulah\Http\Request;
+$root = dirname(__DIR__);
+$autoloader = $root . '/vendor/autoload.php';
+
+if (!is_file($autoloader)) {
+    throw new RuntimeException('Composer dependencies are missing. Run composer install.');
 }
 
-// Bootstrap the framework
-require_once '../app/bootstrap.php';
+require_once $autoloader;
 
-// Check if Core class exists before initializing
-if (class_exists('Core')) {
-    $init = new Core;
-} else {
-    die('Fatal Error: Core framework initialization failed.');
-}
+/** @var Meulah\Application $app */
+$app = require $root . '/bootstrap.php';
+$router = $app->router();
+require $root . '/routes/web.php';
+
+$app->handle(Request::capture())->send();

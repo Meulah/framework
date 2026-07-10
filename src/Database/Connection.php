@@ -1,0 +1,94 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Meulah\Database;
+
+use InvalidArgumentException;
+use PDO;
+use PDOStatement;
+
+final class Connection
+{
+    public function __construct(private readonly PDO $pdo)
+    {
+        $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $this->pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_OBJ);
+        $this->pdo->setAttribute(PDO::ATTR_EMULATE_PREPARES, false);
+    }
+
+    public static function mysql(array $config): self
+    {
+        $host = $config['host'] ?? '127.0.0.1';
+        $port = (int) ($config['port'] ?? 3306);
+        $database = $config['database'] ?? '';
+        $charset = $config['charset'] ?? 'utf8mb4';
+        $dsn = "mysql:host={$host};port={$port};dbname={$database};charset={$charset}";
+
+        return new self(new PDO(
+            $dsn,
+            (string) ($config['username'] ?? ''),
+            (string) ($config['password'] ?? ''),
+        ));
+    }
+
+    public function pdo(): PDO
+    {
+        return $this->pdo;
+    }
+
+    public function execute(string $sql, array $parameters = []): PDOStatement
+    {
+        $statement = $this->pdo->prepare($sql);
+        $statement->execute($parameters);
+
+        return $statement;
+    }
+
+    public function select(string $sql, array $parameters = []): array
+    {
+        return $this->execute($sql, $parameters)->fetchAll();
+    }
+
+    public function first(string $sql, array $parameters = []): object|false
+    {
+        return $this->execute($sql, $parameters)->fetch();
+    }
+
+    public function scalar(string $sql, array $parameters = []): mixed
+    {
+        return $this->execute($sql, $parameters)->fetchColumn();
+    }
+
+    public function insertId(): string|false
+    {
+        return $this->pdo->lastInsertId();
+    }
+
+    public function transaction(callable $callback): mixed
+    {
+        $this->pdo->beginTransaction();
+
+        try {
+            $result = $callback($this);
+            $this->pdo->commit();
+            return $result;
+        } catch (\Throwable $exception) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+    }
+
+    public static function identifier(string $identifier): string
+    {
+        if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $identifier) !== 1) {
+            throw new InvalidArgumentException("Invalid SQL identifier: {$identifier}");
+        }
+
+        return $identifier;
+    }
+}
+
