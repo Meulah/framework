@@ -8,6 +8,8 @@ use JsonException;
 
 final class Request
 {
+    private bool $jsonDecoded = false;
+    private mixed $decodedJson = null;
     private readonly string $method;
     private readonly string $path;
 
@@ -21,7 +23,16 @@ final class Request
         private readonly array $cookies = [],
         private readonly array $files = [],
         private readonly string $rawBody = '',
+        int $maxBodySize = 10_485_760,
     ) {
+        if ($maxBodySize < 1) {
+            throw new \InvalidArgumentException('Maximum request body size must be positive.');
+        }
+
+        if (strlen($this->rawBody) > $maxBodySize) {
+            throw new BadRequest('Request body is too large.');
+        }
+
         $this->method = strtoupper($method);
         $this->path = self::normalizePath($path);
         $this->headers = self::normalizeHeaders($headers);
@@ -30,7 +41,7 @@ final class Request
     /** @var array<string, string> */
     private readonly array $headers;
 
-    public static function capture(): self
+    public static function capture(int $maxBodySize = 10_485_760): self
     {
         $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
         $query = $_GET;
@@ -51,7 +62,13 @@ final class Request
             }
         }
 
-        $rawBody = file_get_contents('php://input');
+        $contentLength = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+
+        if ($contentLength > $maxBodySize) {
+            throw new BadRequest('Request body is too large.');
+        }
+
+        $rawBody = file_get_contents('php://input', false, null, 0, $maxBodySize + 1);
 
         return new self(
             $method,
@@ -63,6 +80,7 @@ final class Request
             $_COOKIE,
             self::normalizeFiles($_FILES),
             $rawBody === false ? '' : $rawBody,
+            $maxBodySize,
         );
     }
 
@@ -83,17 +101,25 @@ final class Request
 
     public function input(?string $key = null, mixed $default = null): mixed
     {
-        $input = array_replace($this->query, $this->body);
-
         if ($this->hasJsonContentType()) {
             $json = $this->json();
-
-            if (is_array($json)) {
-                $input = array_replace($input, $json);
-            }
+            $bodyInput = $this->hasJsonObjectBody() && is_array($json) ? $json : [];
+        } else {
+            $bodyInput = $this->body;
         }
+        $input = array_replace($this->query, is_array($bodyInput) ? $bodyInput : []);
 
         return $key === null ? $input : ($input[$key] ?? $default);
+    }
+
+    public function allInput(): array
+    {
+        return $this->input();
+    }
+
+    public function form(?string $key = null, mixed $default = null): mixed
+    {
+        return $key === null ? $this->body : ($this->body[$key] ?? $default);
     }
 
     public function server(?string $key = null, mixed $default = null): mixed
@@ -110,6 +136,16 @@ final class Request
         return $this->headers[strtolower($name)] ?? $default;
     }
 
+    public function headers(): array
+    {
+        return $this->headers;
+    }
+
+    public function hasHeader(string $name): bool
+    {
+        return array_key_exists(strtolower($name), $this->headers);
+    }
+
     public function cookie(?string $name = null, mixed $default = null): mixed
     {
         return $name === null ? $this->cookies : ($this->cookies[$name] ?? $default);
@@ -120,6 +156,11 @@ final class Request
         return $name === null ? $this->files : ($this->files[$name] ?? $default);
     }
 
+    public function files(): array
+    {
+        return $this->files;
+    }
+
     public function rawBody(): string
     {
         return $this->rawBody;
@@ -127,21 +168,27 @@ final class Request
 
     public function json(?string $key = null, mixed $default = null): mixed
     {
-        if (trim($this->rawBody) === '') {
-            $decoded = [];
-        } else {
-            try {
-                $decoded = json_decode($this->rawBody, true, 512, JSON_THROW_ON_ERROR);
-            } catch (JsonException $exception) {
-                throw new BadRequest('Invalid JSON request body.', 0, $exception);
-            }
-        }
+        $decoded = $this->decodeJson();
 
         if ($key === null) {
             return $decoded;
         }
 
-        return is_array($decoded) ? ($decoded[$key] ?? $default) : $default;
+        if (!$this->hasJsonObjectBody() || !is_array($decoded)) {
+            return $default;
+        }
+
+        $value = $decoded;
+
+        foreach (explode('.', $key) as $segment) {
+            if (!is_array($value) || !array_key_exists($segment, $value)) {
+                return $default;
+            }
+
+            $value = $value[$segment];
+        }
+
+        return $value;
     }
 
     private function hasJsonContentType(): bool
@@ -149,6 +196,32 @@ final class Request
         $contentType = strtolower(trim(explode(';', (string) $this->header('content-type', ''))[0]));
 
         return $contentType === 'application/json' || str_ends_with($contentType, '+json');
+    }
+
+    private function hasJsonObjectBody(): bool
+    {
+        $body = ltrim($this->rawBody);
+        return $body === '' || str_starts_with($body, '{');
+    }
+
+    private function decodeJson(): mixed
+    {
+        if ($this->jsonDecoded) {
+            return $this->decodedJson;
+        }
+
+        if (trim($this->rawBody) === '') {
+            $this->decodedJson = [];
+        } else {
+            try {
+                $this->decodedJson = json_decode($this->rawBody, true, 512, JSON_THROW_ON_ERROR);
+            } catch (JsonException $exception) {
+                throw new BadRequest('Invalid JSON request body.', 0, $exception);
+            }
+        }
+
+        $this->jsonDecoded = true;
+        return $this->decodedJson;
     }
 
     private static function normalizePath(string $path): string
@@ -230,7 +303,7 @@ final class Request
             return $normalized;
         }
 
-        return new UploadedFile(
+        return UploadedFile::fromPhpUpload(
             (string) $file['name'],
             (string) ($file['type'] ?? ''),
             (string) $file['tmp_name'],

@@ -18,4 +18,9 @@ $app = require $root . '/bootstrap.php';
 $router = $app->router();
 require $root . '/routes/web.php';
 
-$app->handle(Request::capture())->send();
+try {
+    $request = Request::capture($app->config()->int('http.max_body_size'));
+    $app->handle($request)->send();
+} catch (Throwable $exception) {
+    $app->renderException($exception)->send();
+}

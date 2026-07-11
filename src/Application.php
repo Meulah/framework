@@ -60,4 +60,9 @@ final class Application
             return $this->exceptions->render($exception);
         }
     }
+
+    public function renderException(Throwable $exception): Response
+    {
+        return $this->exceptions->render($exception);
+    }
 }

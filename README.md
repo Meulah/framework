@@ -53,16 +53,31 @@ Request data remains explicit:
 
 ```php
 $request->header('authorization'); // case-insensitive
+$request->headers();
+$request->hasHeader('authorization');
+$request->query('page');
+$request->form('name');
 $request->json('email');
+$request->json('profile.name');
 $request->cookie('session');
 $request->file('avatar');
+$request->files();
 $request->rawBody();
-$request->input('name');            // query, form, then JSON
+$request->input('name');
+$request->allInput();
 ```
 
-JSON is recognized for `application/json` and `+json` content types. Invalid JSON produces a safe `400 Bad Request` response. Nested PHP uploads are normalized into `UploadedFile` objects while preserving their original keys.
+`input()` contains ordinary values only—uploaded files are never merged into it. For form requests, form values override query values. For JSON requests, object fields override query values and form data is ignored. The selected body representation is therefore used first, with query parameters as fallback.
 
-An uploaded file exposes its client filename, client-provided media type, temporary path, upload error, and size. Call `isValid()` before `moveTo($destination)`. The destination directory must already exist and existing files are never overwritten. Client filenames and media types are untrusted input; applications should generate storage names and inspect file contents independently.
+JSON is recognized for `application/json` and `+json` content types. `json()` returns the complete decoded value, including top-level lists and scalars. Keyed and dotted lookup applies only to top-level JSON objects and otherwise returns the supplied default. An empty JSON body is deliberately treated as an empty input object. Invalid JSON produces a safe `400 Bad Request` response.
+
+The raw request body is read once, cached on the request, and shared by `rawBody()` and `json()`. `HTTP_MAX_BODY_SIZE` defaults to 10 MiB and limits how much data Meulah reads into memory; web-server body limits should also remain enabled.
+
+Nested PHP uploads are normalized into `UploadedFile` objects while preserving their original keys. An uploaded file exposes `clientFilename()`, `clientMediaType()`, server-inspected `detectedMediaType()`, `temporaryPath()`, `error()`, and `size()`. Client filenames and client media types are untrusted input. Applications should generate storage names and validate detected type and file contents independently.
+
+Call `isValid()` before `moveTo($destination)`. The destination must be a writable file path inside an existing directory, existing files are never overwritten, and a file cannot be moved twice. `hasMoved()` and `movedPath()` expose its lifecycle. Production uploads require `is_uploaded_file()` and `move_uploaded_file()`; `UploadedFile::forTesting()` provides an explicit filesystem-backed test double without weakening production checks.
+
+Headers and cookies are raw, untrusted client input. In particular, Meulah does not trust `Forwarded` or `X-Forwarded-*` headers automatically, and retrieving a cookie does not validate, decrypt, or turn it into session state.
 
 ## Middleware
 

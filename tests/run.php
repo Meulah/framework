@@ -16,9 +16,11 @@ use Meulah\Http\Middleware;
 use Meulah\Http\RequestHandler;
 use Meulah\Http\Response;
 use Meulah\Http\UploadedFile;
+use Meulah\Http\UploadException;
 use Meulah\Log\Logger;
 use Meulah\Routing\MethodNotAllowed;
 use Meulah\Routing\RouteNotFound;
+use Meulah\Routing\RouteHandlerException;
 use Meulah\Routing\Router;
 use Meulah\Support\Environment;
 use Meulah\View\View;
@@ -72,7 +74,11 @@ $test('captured requests hide the internal rewrite parameter', static function (
 });
 
 $test('request exposes headers JSON cookies and files', static function () use ($assertSame): void {
-    $upload = new UploadedFile('avatar.png', 'image/png', 'C:/tmp/upload', UPLOAD_ERR_OK, 2048);
+    $upload = UploadedFile::forTesting(
+        __DIR__ . '/fixtures/views/greeting.php',
+        'avatar.png',
+        'image/png',
+    );
     $request = new Request(
         'POST',
         '/profile',
@@ -88,11 +94,107 @@ $test('request exposes headers JSON cookies and files', static function () use (
     $assertSame('abc123', $request->header('x-trace'));
     $assertSame('application/vnd.api+json; charset=UTF-8', $request->header('CONTENT-TYPE'));
     $assertSame('cookie-value', $request->cookie('session'));
+    $assertSame(true, $request->hasHeader('X-Trace'));
+    $assertSame('abc123', $request->headers()['x-trace']);
     $assertSame($upload, $request->file('avatar'));
+    $assertSame($upload, $request->files()['avatar']);
     $assertSame('{"name":"json-name","active":true}', $request->rawBody());
     $assertSame(true, $request->json('active'));
     $assertSame('json-name', $request->input('name'));
     $assertSame('query', $request->input('source'));
+    $assertSame('form-name', $request->form('name'));
+});
+
+$test('JSON objects override query input without merging form data', static function () use ($assertSame): void {
+    $request = new Request(
+        'POST',
+        '/input',
+        ['email' => 'query@example.com', 'page' => '2'],
+        ['email' => 'form@example.com', 'form_only' => 'ignored'],
+        headers: ['Content-Type' => 'application/json'],
+        rawBody: '{"email":"json@example.com","profile":{"name":"Ada"}}',
+    );
+
+    $assertSame('json@example.com', $request->input('email'));
+    $assertSame('2', $request->input('page'));
+    $assertSame(null, $request->input('form_only'));
+    $assertSame('Ada', $request->json('profile.name'));
+    $assertSame($request->input(), $request->allInput());
+});
+
+$test('keyed JSON lookup ignores top-level lists and scalars', static function () use ($assertSame): void {
+    $list = new Request('POST', '/', rawBody: '["one","two"]');
+    $scalar = new Request('POST', '/', rawBody: '42');
+
+    $assertSame(['one', 'two'], $list->json());
+    $assertSame('fallback', $list->json('email', 'fallback'));
+    $assertSame(42, $scalar->json());
+    $assertSame('fallback', $scalar->json('email', 'fallback'));
+});
+
+$test('request body size limits fail before parsing', static function () use ($assertSame): void {
+    try {
+        new Request('POST', '/', rawBody: '12345', maxBodySize: 4);
+        throw new RuntimeException('Expected body size rejection.');
+    } catch (\Meulah\Http\BadRequest $exception) {
+        $assertSame('Request body is too large.', $exception->getMessage());
+    }
+});
+
+$test('captured requests reject oversized content before reading it', static function () use ($assertSame): void {
+    $originalServer = $_SERVER;
+
+    try {
+        $_SERVER['CONTENT_LENGTH'] = '100';
+
+        try {
+            Request::capture(10);
+            throw new RuntimeException('Expected captured body size rejection.');
+        } catch (\Meulah\Http\BadRequest $exception) {
+            $assertSame('Request body is too large.', $exception->getMessage());
+        }
+    } finally {
+        $_SERVER = $originalServer;
+    }
+});
+
+$test('test uploads expose detected MIME and track move state', static function () use ($assertSame): void {
+    $source = tempnam(sys_get_temp_dir(), 'meulah-upload-');
+
+    if ($source === false) {
+        throw new RuntimeException('Unable to create test upload.');
+    }
+
+    $destination = $source . '-moved.txt';
+    file_put_contents($source, 'plain text upload');
+
+    try {
+        $upload = UploadedFile::forTesting($source, '../unsafe-name.txt', 'image/jpeg');
+
+        $assertSame('../unsafe-name.txt', $upload->clientFilename());
+        $assertSame('image/jpeg', $upload->clientMediaType());
+        $assertSame('text/plain', $upload->detectedMediaType());
+        $assertSame(true, $upload->isValid());
+        $assertSame(false, $upload->hasMoved());
+
+        $upload->moveTo($destination);
+        $assertSame(true, $upload->hasMoved());
+        $assertSame($destination, $upload->movedPath());
+        $assertSame(false, $upload->isValid());
+
+        try {
+            $upload->moveTo($destination . '-again');
+            throw new RuntimeException('Expected repeated move rejection.');
+        } catch (UploadException) {
+        }
+    } finally {
+        if (is_file($source)) {
+            unlink($source);
+        }
+        if (is_file($destination)) {
+            unlink($destination);
+        }
+    }
 });
 
 $test('captured requests normalize nested PHP uploads', static function () use ($assertSame): void {
@@ -166,6 +268,18 @@ $test('route handlers can receive the request before path parameters', static fu
     ));
 
     $assertSame('en:42', $response->content());
+});
+
+$test('route handler injection is strict and reports argument mismatches', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->get('/users/{user}', static fn ($request, string $user): string => $user);
+
+    try {
+        $router->dispatch(new Request('GET', '/users/42'));
+        throw new RuntimeException('Expected route argument mismatch.');
+    } catch (RouteHandlerException $exception) {
+        $assertSame('Route handler requires 2 arguments; 1 provided.', $exception->getMessage());
+    }
 });
 
 $test('router dispatches static routes', static function () use ($assertSame): void {

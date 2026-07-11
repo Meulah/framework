@@ -140,8 +140,26 @@ final class Router
             && !$type->isBuiltin()
             && $type->getName() === Request::class;
 
-        return $acceptsRequest
-            ? $handler($request, ...$parameters)
-            : $handler(...$parameters);
+        $arguments = $acceptsRequest ? [$request, ...$parameters] : $parameters;
+        $maximum = $reflection->getNumberOfParameters();
+        $provided = count($arguments);
+
+        if ($provided < $reflection->getNumberOfRequiredParameters()) {
+            throw new RouteHandlerException(sprintf(
+                'Route handler requires %d arguments; %d provided.',
+                $reflection->getNumberOfRequiredParameters(),
+                $provided,
+            ));
+        }
+
+        if (!$reflection->isVariadic() && $provided > $maximum) {
+            throw new RouteHandlerException(sprintf(
+                'Route handler accepts at most %d arguments; %d provided.',
+                $maximum,
+                $provided,
+            ));
+        }
+
+        return $handler(...$arguments);
     }
 }
