@@ -10,7 +10,7 @@ use Meulah\Http\CallableRequestHandler;
 use Meulah\Http\Middleware;
 use Meulah\Http\MiddlewarePipeline;
 use Meulah\Http\Request;
-use Meulah\Http\Response;
+use Meulah\Http\ResponseInterface;
 use Meulah\Log\ErrorLogLogger;
 use Meulah\Routing\Router;
 use Throwable;
@@ -47,22 +47,22 @@ final class Application
         return $this;
     }
 
-    public function handle(Request $request): Response
+    public function handle(Request $request): ResponseInterface
     {
         try {
             $destination = new CallableRequestHandler(
-                fn (Request $request): Response => $this->router->dispatch($request),
+                fn (Request $request): ResponseInterface => $this->router->dispatch($request),
             );
             $response = (new MiddlewarePipeline($this->middleware, $destination))->handle($request);
 
             return $request->method() === 'HEAD' ? $response->withoutBody() : $response;
         } catch (Throwable $exception) {
-            return $this->exceptions->render($exception);
+            return $this->exceptions->render($exception, $request);
         }
     }
 
-    public function renderException(Throwable $exception): Response
+    public function renderException(Throwable $exception, ?Request $request = null): ResponseInterface
     {
-        return $this->exceptions->render($exception);
+        return $this->exceptions->render($exception, $request);
     }
 }

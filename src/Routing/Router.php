@@ -9,6 +9,7 @@ use Meulah\Http\CallableRequestHandler;
 use Meulah\Http\MiddlewarePipeline;
 use Meulah\Http\Request;
 use Meulah\Http\Response;
+use Meulah\Http\ResponseInterface;
 use ReflectionFunction;
 use ReflectionNamedType;
 use UnexpectedValueException;
@@ -33,7 +34,7 @@ final class Router
         return $this->add($methods, $path, $handler, $name);
     }
 
-    public function dispatch(Request $request): Response
+    public function dispatch(Request $request): ResponseInterface
     {
         $allowed = [];
 
@@ -51,7 +52,7 @@ final class Router
 
             $handler = $this->resolveHandler($route->handler);
             $destination = new CallableRequestHandler(
-                fn (Request $request): Response => $this->toResponse(
+                fn (Request $request): ResponseInterface => $this->toResponse(
                     $this->invokeHandler($handler, $request, array_values($parameters)),
                 ),
             );
@@ -119,10 +120,10 @@ final class Router
         return $handler;
     }
 
-    private function toResponse(mixed $result): Response
+    private function toResponse(mixed $result): ResponseInterface
     {
         return match (true) {
-            $result instanceof Response => $result,
+            $result instanceof ResponseInterface => $result,
             is_string($result) => Response::html($result),
             $result === null => new Response(),
             default => throw new UnexpectedValueException(

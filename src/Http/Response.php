@@ -5,8 +5,9 @@ declare(strict_types=1);
 namespace Meulah\Http;
 
 use InvalidArgumentException;
+use JsonException;
 
-final class Response
+final class Response implements ResponseInterface
 {
     public function __construct(
         private readonly string $content = '',
@@ -36,6 +37,16 @@ final class Response
     public static function redirect(string $location, int $status = 302): self
     {
         return new self('', $status, ['Location' => $location]);
+    }
+
+    /** @throws JsonException */
+    public static function json(mixed $data, int $status = 200): self
+    {
+        return new self(
+            json_encode($data, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+            $status,
+            ['Content-Type' => 'application/json; charset=UTF-8'],
+        );
     }
 
     public function status(): int

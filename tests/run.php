@@ -12,9 +12,12 @@ use Meulah\Database\MigrationRepository;
 use Meulah\Database\Migrator;
 use Meulah\Exception\ExceptionHandler;
 use Meulah\Http\Request;
+use Meulah\Http\BadRequest;
+use Meulah\Http\InvalidInput;
 use Meulah\Http\Middleware;
 use Meulah\Http\RequestHandler;
 use Meulah\Http\Response;
+use Meulah\Http\ResponseInterface;
 use Meulah\Http\UploadedFile;
 use Meulah\Http\UploadException;
 use Meulah\Log\Logger;
@@ -98,6 +101,7 @@ $test('request exposes headers JSON cookies and files', static function () use (
     $assertSame('abc123', $request->headers()['x-trace']);
     $assertSame($upload, $request->file('avatar'));
     $assertSame($upload, $request->files()['avatar']);
+    $assertSame(true, $request->hasFile('avatar'));
     $assertSame('{"name":"json-name","active":true}', $request->rawBody());
     $assertSame(true, $request->json('active'));
     $assertSame('json-name', $request->input('name'));
@@ -120,6 +124,9 @@ $test('JSON objects override query input without merging form data', static func
     $assertSame(null, $request->input('form_only'));
     $assertSame('Ada', $request->json('profile.name'));
     $assertSame($request->input(), $request->allInput());
+    $assertSame(true, $request->hasInput('email'));
+    $assertSame(true, $request->filled('email'));
+    $assertSame(false, $request->hasInput('missing'));
 });
 
 $test('keyed JSON lookup ignores top-level lists and scalars', static function () use ($assertSame): void {
@@ -130,6 +137,55 @@ $test('keyed JSON lookup ignores top-level lists and scalars', static function (
     $assertSame('fallback', $list->json('email', 'fallback'));
     $assertSame(42, $scalar->json());
     $assertSame('fallback', $scalar->json('email', 'fallback'));
+});
+
+$test('JSON object and array shapes remain distinct', static function () use ($assertSame): void {
+    $object = new Request('POST', '/', rawBody: '{}');
+    $array = new Request('POST', '/', rawBody: '[]');
+    $empty = new Request('POST', '/', rawBody: '');
+
+    $assertSame(true, $object->jsonValue() instanceof stdClass);
+    $assertSame(true, $empty->jsonValue() instanceof stdClass);
+    $assertSame([], $array->jsonArray());
+
+    try {
+        $array->jsonObject();
+        throw new RuntimeException('Expected JSON object shape rejection.');
+    } catch (BadRequest $exception) {
+        $assertSame('invalid_json_shape', $exception->errorCode());
+    }
+
+    try {
+        $object->jsonArray();
+        throw new RuntimeException('Expected JSON array shape rejection.');
+    } catch (BadRequest $exception) {
+        $assertSame('invalid_json_shape', $exception->errorCode());
+    }
+});
+
+$test('typed input is strict and defaults apply only when missing', static function () use ($assertSame): void {
+    $request = new Request('POST', '/', body: [
+        'name' => 'Ada',
+        'page' => '12',
+        'published' => 'false',
+        'roles' => ['admin'],
+        'invalid_age' => 'twelve',
+        'zero' => '0',
+    ]);
+
+    $assertSame('Ada', $request->string('name'));
+    $assertSame(12, $request->integer('page'));
+    $assertSame(false, $request->boolean('published'));
+    $assertSame(['admin'], $request->array('roles'));
+    $assertSame(1, $request->integer('missing', default: 1));
+    $assertSame(true, $request->filled('zero'));
+
+    try {
+        $request->integer('invalid_age', default: 18);
+        throw new RuntimeException('Expected invalid integer rejection.');
+    } catch (InvalidInput $exception) {
+        $assertSame("Input 'invalid_age' must be an integer.", $exception->getMessage());
+    }
 });
 
 $test('request body size limits fail before parsing', static function () use ($assertSame): void {
@@ -250,9 +306,36 @@ $test('malformed JSON is rendered as a bad request', static function () use ($as
     );
 
     $response = $application->handle($request);
+    $payload = json_decode($response->content(), true, 512, JSON_THROW_ON_ERROR);
 
     $assertSame(400, $response->status());
-    $assertSame(false, str_contains($response->content(), '{broken'));
+    $assertSame('application/json; charset=UTF-8', $response->headers()['Content-Type']);
+    $assertSame('invalid_json', $payload['error']['code']);
+    $assertSame('The request body contains malformed JSON.', $payload['error']['message']);
+    $assertSame(false, array_key_exists('detail', $payload['error']));
+});
+
+$test('development JSON errors may include safe parser detail', static function () use ($assertSame): void {
+    $logger = new class implements Logger {
+        public function error(Throwable $exception): void
+        {
+        }
+    };
+    $handler = new ExceptionHandler(true, $logger);
+    $request = new Request('POST', '/', headers: ['Accept' => 'application/json']);
+    $exception = new BadRequest(
+        'The request body contains malformed JSON.',
+        'invalid_json',
+        'Syntax error.',
+    );
+    $payload = json_decode(
+        $handler->render($exception, $request)->content(),
+        true,
+        512,
+        JSON_THROW_ON_ERROR,
+    );
+
+    $assertSame('Syntax error.', $payload['error']['detail']);
 });
 
 $test('route handlers can receive the request before path parameters', static function () use ($assertSame): void {
@@ -289,6 +372,43 @@ $test('router dispatches static routes', static function () use ($assertSame): v
     $response = $router->dispatch(new Request('GET', '/health'));
 
     $assertSame('ok', $response->content());
+});
+
+$test('routing accepts custom response interface implementations', static function () use ($assertSame): void {
+    $custom = new class implements ResponseInterface {
+        public function status(): int
+        {
+            return 202;
+        }
+
+        public function content(): string
+        {
+            return 'custom';
+        }
+
+        public function headers(): array
+        {
+            return [];
+        }
+
+        public function withoutBody(): self
+        {
+            return $this;
+        }
+
+        public function withHeader(string $name, string $value): self
+        {
+            return $this;
+        }
+
+        public function send(): void
+        {
+        }
+    };
+    $router = new Router();
+    $router->get('/custom-response', static fn (): ResponseInterface => $custom);
+
+    $assertSame($custom, $router->dispatch(new Request('GET', '/custom-response')));
 });
 
 $test('router passes decoded route parameters', static function () use ($assertSame): void {

@@ -13,18 +13,17 @@ final class MiddlewarePipeline implements RequestHandler
     ) {
     }
 
-    public function handle(Request $request): Response
+    public function handle(Request $request): ResponseInterface
     {
         $handler = $this->destination;
 
         foreach (array_reverse($this->middleware) as $middleware) {
             $next = $handler;
             $handler = new CallableRequestHandler(
-                static fn (Request $request): Response => $middleware->process($request, $next),
+                static fn (Request $request): ResponseInterface => $middleware->process($request, $next),
             );
         }
 
         return $handler->handle($request);
     }
 }
-

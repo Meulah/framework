@@ -34,6 +34,8 @@ $router->get('/', static fn (): Response => Response::html('<h1>Hello</h1>'), 'h
 
 Unknown paths return `404 Not Found`. A known path requested with an unsupported HTTP method returns `405 Method Not Allowed` with an `Allow` header.
 
+`Meulah\Http\Response` is the default implementation of `ResponseInterface`. Routing, middleware, request handlers, and the application kernel depend on the interface, so applications may return another compatible response implementation when needed.
+
 ## Request data
 
 Type the first route-handler parameter as `Request` to receive the current request. Route parameters follow it:
@@ -59,17 +61,34 @@ $request->query('page');
 $request->form('name');
 $request->json('email');
 $request->json('profile.name');
+$request->jsonValue();
+$request->jsonObject();
+$request->jsonArray();
 $request->cookie('session');
 $request->file('avatar');
 $request->files();
 $request->rawBody();
 $request->input('name');
 $request->allInput();
+$request->hasInput('name');
+$request->filled('name');
+$request->hasFile('avatar');
 ```
 
 `input()` contains ordinary values only—uploaded files are never merged into it. For form requests, form values override query values. For JSON requests, object fields override query values and form data is ignored. The selected body representation is therefore used first, with query parameters as fallback.
 
-JSON is recognized for `application/json` and `+json` content types. `json()` returns the complete decoded value, including top-level lists and scalars. Keyed and dotted lookup applies only to top-level JSON objects and otherwise returns the supplied default. An empty JSON body is deliberately treated as an empty input object. Invalid JSON produces a safe `400 Bad Request` response.
+JSON is recognized for `application/json` and `+json` content types. `jsonValue()` and `json()` without a key return the exact decoded shape: objects remain `stdClass`, arrays remain arrays, and scalars remain scalars. `jsonObject()` and `jsonArray()` enforce the expected top-level shape with a `400` error. Keyed and dotted `json()` lookup applies only to top-level JSON objects and otherwise returns the supplied default. An empty JSON body is deliberately treated as an empty object.
+
+Typed input access is strict:
+
+```php
+$request->string('name');
+$request->integer('page', default: 1);
+$request->boolean('published', default: false);
+$request->array('roles');
+```
+
+Defaults apply only when input is missing. A supplied value of the wrong type produces an `invalid_input` 400 error instead of silently coercing to `0`, `false`, or an empty value. Request data has no merge or replace methods: it continues to represent the original client request, while validation and normalization should produce separate application data.
 
 The raw request body is read once, cached on the request, and shared by `rawBody()` and `json()`. `HTTP_MAX_BODY_SIZE` defaults to 10 MiB and limits how much data Meulah reads into memory; web-server body limits should also remain enabled.
 
@@ -78,6 +97,19 @@ Nested PHP uploads are normalized into `UploadedFile` objects while preserving t
 Call `isValid()` before `moveTo($destination)`. The destination must be a writable file path inside an existing directory, existing files are never overwritten, and a file cannot be moved twice. `hasMoved()` and `movedPath()` expose its lifecycle. Production uploads require `is_uploaded_file()` and `move_uploaded_file()`; `UploadedFile::forTesting()` provides an explicit filesystem-backed test double without weakening production checks.
 
 Headers and cookies are raw, untrusted client input. In particular, Meulah does not trust `Forwarded` or `X-Forwarded-*` headers automatically, and retrieving a cookie does not validate, decrypt, or turn it into session state.
+
+For requests that expect JSON, malformed bodies and other request errors use a stable machine-readable shape:
+
+```json
+{
+  "error": {
+    "code": "invalid_json",
+    "message": "The request body contains malformed JSON."
+  }
+}
+```
+
+Parser detail is omitted in production and included only when development debugging is enabled.
 
 ## Middleware
 

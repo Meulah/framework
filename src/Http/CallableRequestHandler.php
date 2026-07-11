@@ -15,9 +15,8 @@ final class CallableRequestHandler implements RequestHandler
         $this->handler = Closure::fromCallable($handler);
     }
 
-    public function handle(Request $request): Response
+    public function handle(Request $request): ResponseInterface
     {
         return ($this->handler)($request);
     }
 }
-

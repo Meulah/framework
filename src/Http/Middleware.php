@@ -6,6 +6,5 @@ namespace Meulah\Http;
 
 interface Middleware
 {
-    public function process(Request $request, RequestHandler $next): Response;
+    public function process(Request $request, RequestHandler $next): ResponseInterface;
 }
-

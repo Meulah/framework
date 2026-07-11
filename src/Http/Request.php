@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Meulah\Http;
 
 use JsonException;
+use stdClass;
 
 final class Request
 {
@@ -30,7 +31,7 @@ final class Request
         }
 
         if (strlen($this->rawBody) > $maxBodySize) {
-            throw new BadRequest('Request body is too large.');
+            throw new BadRequest('Request body is too large.', 'payload_too_large', status: 413);
         }
 
         $this->method = strtoupper($method);
@@ -65,7 +66,7 @@ final class Request
         $contentLength = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
 
         if ($contentLength > $maxBodySize) {
-            throw new BadRequest('Request body is too large.');
+            throw new BadRequest('Request body is too large.', 'payload_too_large', status: 413);
         }
 
         $rawBody = file_get_contents('php://input', false, null, 0, $maxBodySize + 1);
@@ -102,8 +103,8 @@ final class Request
     public function input(?string $key = null, mixed $default = null): mixed
     {
         if ($this->hasJsonContentType()) {
-            $json = $this->json();
-            $bodyInput = $this->hasJsonObjectBody() && is_array($json) ? $json : [];
+            $json = $this->jsonValue();
+            $bodyInput = $json instanceof stdClass ? get_object_vars($json) : [];
         } else {
             $bodyInput = $this->body;
         }
@@ -115,6 +116,21 @@ final class Request
     public function allInput(): array
     {
         return $this->input();
+    }
+
+    public function hasInput(string $key): bool
+    {
+        return array_key_exists($key, $this->allInput());
+    }
+
+    public function filled(string $key): bool
+    {
+        if (!$this->hasInput($key)) {
+            return false;
+        }
+
+        $value = $this->input($key);
+        return $value !== null && $value !== '' && $value !== [];
     }
 
     public function form(?string $key = null, mixed $default = null): mixed
@@ -153,12 +169,17 @@ final class Request
 
     public function file(?string $name = null, mixed $default = null): mixed
     {
-        return $name === null ? $this->files : ($this->files[$name] ?? $default);
+        return $name === null ? $this->files : $this->valueByPath($this->files, $name, $default);
     }
 
     public function files(): array
     {
         return $this->files;
+    }
+
+    public function hasFile(string $name): bool
+    {
+        return $this->containsValidFile($this->file($name));
     }
 
     public function rawBody(): string
@@ -168,24 +189,123 @@ final class Request
 
     public function json(?string $key = null, mixed $default = null): mixed
     {
-        $decoded = $this->decodeJson();
+        $decoded = $this->jsonValue();
 
         if ($key === null) {
             return $decoded;
         }
 
-        if (!$this->hasJsonObjectBody() || !is_array($decoded)) {
+        if (!$decoded instanceof stdClass) {
             return $default;
         }
 
         $value = $decoded;
 
         foreach (explode('.', $key) as $segment) {
-            if (!is_array($value) || !array_key_exists($segment, $value)) {
+            if (!$value instanceof stdClass || !property_exists($value, $segment)) {
                 return $default;
             }
 
-            $value = $value[$segment];
+            $value = $value->{$segment};
+        }
+
+        return $value;
+    }
+
+    public function jsonValue(): mixed
+    {
+        return $this->decodeJson();
+    }
+
+    public function jsonObject(): object
+    {
+        $value = $this->jsonValue();
+
+        if (!$value instanceof stdClass) {
+            throw new BadRequest(
+                'Expected a JSON object, received ' . $this->jsonType($value) . '.',
+                'invalid_json_shape',
+            );
+        }
+
+        return $value;
+    }
+
+    public function jsonArray(): array
+    {
+        $value = $this->jsonValue();
+
+        if (!is_array($value)) {
+            throw new BadRequest(
+                'Expected a JSON array, received ' . $this->jsonType($value) . '.',
+                'invalid_json_shape',
+            );
+        }
+
+        return $value;
+    }
+
+    public function string(string $key, ?string $default = null): ?string
+    {
+        if (!$this->hasInput($key)) {
+            return func_num_args() >= 2 ? $default : throw new InvalidInput("Input '{$key}' is required.");
+        }
+
+        $value = $this->input($key);
+
+        if (!is_string($value)) {
+            throw new InvalidInput("Input '{$key}' must be a string.");
+        }
+
+        return $value;
+    }
+
+    public function integer(string $key, ?int $default = null): ?int
+    {
+        if (!$this->hasInput($key)) {
+            return func_num_args() >= 2 ? $default : throw new InvalidInput("Input '{$key}' is required.");
+        }
+
+        $value = $this->input($key);
+
+        if (is_int($value)) {
+            return $value;
+        }
+
+        if (is_string($value) && preg_match('/^-?(?:0|[1-9][0-9]*)$/', $value) === 1) {
+            $integer = filter_var($value, FILTER_VALIDATE_INT);
+
+            if ($integer !== false) {
+                return $integer;
+            }
+        }
+
+        throw new InvalidInput("Input '{$key}' must be an integer.");
+    }
+
+    public function boolean(string $key, ?bool $default = null): ?bool
+    {
+        if (!$this->hasInput($key)) {
+            return func_num_args() >= 2 ? $default : throw new InvalidInput("Input '{$key}' is required.");
+        }
+
+        return match ($this->input($key)) {
+            true, 1, '1', 'true' => true,
+            false, 0, '0', 'false' => false,
+            default => throw new InvalidInput("Input '{$key}' must be a boolean."),
+        };
+    }
+
+    public function array(string $key, ?array $default = null): ?array
+    {
+        if (!$this->hasInput($key)) {
+            return func_num_args() >= 2 ? $default : throw new InvalidInput("Input '{$key}' is required.");
+        }
+
+        $value = $this->input($key);
+
+        if (!is_array($value)) {
+            throw new InvalidInput("Input '{$key}' must be an array.");
         }
 
         return $value;
@@ -198,12 +318,6 @@ final class Request
         return $contentType === 'application/json' || str_ends_with($contentType, '+json');
     }
 
-    private function hasJsonObjectBody(): bool
-    {
-        $body = ltrim($this->rawBody);
-        return $body === '' || str_starts_with($body, '{');
-    }
-
     private function decodeJson(): mixed
     {
         if ($this->jsonDecoded) {
@@ -211,17 +325,77 @@ final class Request
         }
 
         if (trim($this->rawBody) === '') {
-            $this->decodedJson = [];
+            $this->decodedJson = new stdClass();
         } else {
             try {
-                $this->decodedJson = json_decode($this->rawBody, true, 512, JSON_THROW_ON_ERROR);
+                $this->decodedJson = json_decode($this->rawBody, false, 512, JSON_THROW_ON_ERROR);
             } catch (JsonException $exception) {
-                throw new BadRequest('Invalid JSON request body.', 0, $exception);
+                throw new BadRequest(
+                    'The request body contains malformed JSON.',
+                    'invalid_json',
+                    $exception->getMessage(),
+                    previous: $exception,
+                );
             }
         }
 
         $this->jsonDecoded = true;
         return $this->decodedJson;
+    }
+
+    private function jsonType(mixed $value): string
+    {
+        return match (true) {
+            is_array($value) => 'an array',
+            is_string($value) => 'a string',
+            is_int($value), is_float($value) => 'a number',
+            is_bool($value) => 'a boolean',
+            $value === null => 'null',
+            default => 'an object',
+        };
+    }
+
+    private function valueByPath(array $values, string $path, mixed $default): mixed
+    {
+        $value = $values;
+
+        foreach (explode('.', $path) as $segment) {
+            if (!is_array($value) || !array_key_exists($segment, $value)) {
+                return $default;
+            }
+
+            $value = $value[$segment];
+        }
+
+        return $value;
+    }
+
+    private function containsValidFile(mixed $value): bool
+    {
+        if ($value instanceof UploadedFile) {
+            return $value->isValid();
+        }
+
+        if (is_array($value)) {
+            foreach ($value as $file) {
+                if ($this->containsValidFile($file)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    public function expectsJson(): bool
+    {
+        if ($this->hasJsonContentType()) {
+            return true;
+        }
+
+        $accept = strtolower((string) $this->header('accept', ''));
+        return str_contains($accept, 'application/json')
+            || preg_match('#application/[a-z0-9.+-]+\+json#', $accept) === 1;
     }
 
     private static function normalizePath(string $path): string

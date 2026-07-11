@@ -6,6 +6,5 @@ namespace Meulah\Http;
 
 interface RequestHandler
 {
-    public function handle(Request $request): Response;
+    public function handle(Request $request): ResponseInterface;
 }
-

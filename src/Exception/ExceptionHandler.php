@@ -6,6 +6,7 @@ namespace Meulah\Exception;
 
 use Meulah\Http\Response;
 use Meulah\Http\BadRequest;
+use Meulah\Http\Request;
 use Meulah\Log\Logger;
 use Meulah\Routing\MethodNotAllowed;
 use Meulah\Routing\RouteNotFound;
@@ -19,10 +20,27 @@ final class ExceptionHandler
     ) {
     }
 
-    public function render(Throwable $exception): Response
+    public function render(Throwable $exception, ?Request $request = null): Response
     {
         if ($exception instanceof BadRequest) {
-            return Response::html('<h1>400</h1><p>Bad request.</p>', 400);
+            if ($request?->expectsJson()) {
+                $error = [
+                    'code' => $exception->errorCode(),
+                    'message' => $exception->getMessage(),
+                ];
+
+                if ($this->debug && $exception->detail() !== null) {
+                    $error['detail'] = $exception->detail();
+                }
+
+                return Response::json(['error' => $error], $exception->status());
+            }
+
+            $title = $exception->status() === 413 ? 'Payload too large.' : 'Bad request.';
+            return Response::html(
+                "<h1>{$exception->status()}</h1><p>{$title}</p>",
+                $exception->status(),
+            );
         }
 
         if ($exception instanceof MethodNotAllowed) {

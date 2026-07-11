@@ -22,5 +22,5 @@ try {
     $request = Request::capture($app->config()->int('http.max_body_size'));
     $app->handle($request)->send();
 } catch (Throwable $exception) {
-    $app->renderException($exception)->send();
+    $app->renderException($exception, $request ?? null)->send();
 }
