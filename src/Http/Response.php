@@ -58,6 +58,21 @@ final class Response
         return new self('', $this->status, $this->headers);
     }
 
+    public function withHeader(string $name, string $value): self
+    {
+        $headers = $this->headers;
+
+        foreach (array_keys($headers) as $existingName) {
+            if (strcasecmp($existingName, $name) === 0) {
+                unset($headers[$existingName]);
+            }
+        }
+
+        $headers[$name] = $value;
+
+        return new self($this->content, $this->status, $headers);
+    }
+
     public function send(): void
     {
         http_response_code($this->status);

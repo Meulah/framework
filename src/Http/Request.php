@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Meulah\Http;
 
+use JsonException;
+
 final class Request
 {
     private readonly string $method;
@@ -15,10 +17,18 @@ final class Request
         private readonly array $query = [],
         private readonly array $body = [],
         private readonly array $server = [],
+        array $headers = [],
+        private readonly array $cookies = [],
+        private readonly array $files = [],
+        private readonly string $rawBody = '',
     ) {
         $this->method = strtoupper($method);
         $this->path = self::normalizePath($path);
+        $this->headers = self::normalizeHeaders($headers);
     }
+
+    /** @var array<string, string> */
+    private readonly array $headers;
 
     public static function capture(): self
     {
@@ -41,7 +51,19 @@ final class Request
             }
         }
 
-        return new self($method, $path, $query, $_POST, $_SERVER);
+        $rawBody = file_get_contents('php://input');
+
+        return new self(
+            $method,
+            $path,
+            $query,
+            $_POST,
+            $_SERVER,
+            self::headersFromServer($_SERVER),
+            $_COOKIE,
+            self::normalizeFiles($_FILES),
+            $rawBody === false ? '' : $rawBody,
+        );
     }
 
     public function method(): string
@@ -63,6 +85,14 @@ final class Request
     {
         $input = array_replace($this->query, $this->body);
 
+        if ($this->hasJsonContentType()) {
+            $json = $this->json();
+
+            if (is_array($json)) {
+                $input = array_replace($input, $json);
+            }
+        }
+
         return $key === null ? $input : ($input[$key] ?? $default);
     }
 
@@ -71,10 +101,141 @@ final class Request
         return $key === null ? $this->server : ($this->server[$key] ?? $default);
     }
 
+    public function header(?string $name = null, mixed $default = null): mixed
+    {
+        if ($name === null) {
+            return $this->headers;
+        }
+
+        return $this->headers[strtolower($name)] ?? $default;
+    }
+
+    public function cookie(?string $name = null, mixed $default = null): mixed
+    {
+        return $name === null ? $this->cookies : ($this->cookies[$name] ?? $default);
+    }
+
+    public function file(?string $name = null, mixed $default = null): mixed
+    {
+        return $name === null ? $this->files : ($this->files[$name] ?? $default);
+    }
+
+    public function rawBody(): string
+    {
+        return $this->rawBody;
+    }
+
+    public function json(?string $key = null, mixed $default = null): mixed
+    {
+        if (trim($this->rawBody) === '') {
+            $decoded = [];
+        } else {
+            try {
+                $decoded = json_decode($this->rawBody, true, 512, JSON_THROW_ON_ERROR);
+            } catch (JsonException $exception) {
+                throw new BadRequest('Invalid JSON request body.', 0, $exception);
+            }
+        }
+
+        if ($key === null) {
+            return $decoded;
+        }
+
+        return is_array($decoded) ? ($decoded[$key] ?? $default) : $default;
+    }
+
+    private function hasJsonContentType(): bool
+    {
+        $contentType = strtolower(trim(explode(';', (string) $this->header('content-type', ''))[0]));
+
+        return $contentType === 'application/json' || str_ends_with($contentType, '+json');
+    }
+
     private static function normalizePath(string $path): string
     {
         $path = '/' . trim(rawurldecode($path), '/');
 
         return $path === '/' ? '/' : rtrim($path, '/');
+    }
+
+    private static function normalizeHeaders(array $headers): array
+    {
+        $normalized = [];
+
+        foreach ($headers as $name => $value) {
+            if (is_string($name) && is_scalar($value)) {
+                $normalized[strtolower($name)] = (string) $value;
+            }
+        }
+
+        return $normalized;
+    }
+
+    private static function headersFromServer(array $server): array
+    {
+        $headers = [];
+
+        foreach ($server as $name => $value) {
+            if (str_starts_with($name, 'HTTP_')) {
+                $header = str_replace('_', '-', substr($name, 5));
+                $headers[$header] = $value;
+            }
+        }
+
+        foreach (['CONTENT_TYPE' => 'Content-Type', 'CONTENT_LENGTH' => 'Content-Length'] as $key => $header) {
+            if (isset($server[$key])) {
+                $headers[$header] = $server[$key];
+            }
+        }
+
+        if (!isset($headers['Authorization'])) {
+            $authorization = $server['AUTHORIZATION'] ?? $server['REDIRECT_HTTP_AUTHORIZATION'] ?? null;
+
+            if ($authorization !== null) {
+                $headers['Authorization'] = $authorization;
+            }
+        }
+
+        return $headers;
+    }
+
+    private static function normalizeFiles(array $files): array
+    {
+        $normalized = [];
+
+        foreach ($files as $name => $file) {
+            if (is_array($file) && isset($file['name'], $file['tmp_name'], $file['error'], $file['size'])) {
+                $normalized[$name] = self::normalizeFile($file);
+            }
+        }
+
+        return $normalized;
+    }
+
+    private static function normalizeFile(array $file): UploadedFile|array
+    {
+        if (is_array($file['name'])) {
+            $normalized = [];
+
+            foreach (array_keys($file['name']) as $key) {
+                $normalized[$key] = self::normalizeFile([
+                    'name' => $file['name'][$key],
+                    'type' => $file['type'][$key] ?? '',
+                    'tmp_name' => $file['tmp_name'][$key],
+                    'error' => $file['error'][$key],
+                    'size' => $file['size'][$key],
+                ]);
+            }
+
+            return $normalized;
+        }
+
+        return new UploadedFile(
+            (string) $file['name'],
+            (string) ($file['type'] ?? ''),
+            (string) $file['tmp_name'],
+            (int) $file['error'],
+            (int) $file['size'],
+        );
     }
 }

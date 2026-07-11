@@ -34,6 +34,73 @@ $router->get('/', static fn (): Response => Response::html('<h1>Hello</h1>'), 'h
 
 Unknown paths return `404 Not Found`. A known path requested with an unsupported HTTP method returns `405 Method Not Allowed` with an `Allow` header.
 
+## Request data
+
+Type the first route-handler parameter as `Request` to receive the current request. Route parameters follow it:
+
+```php
+use Meulah\Http\Request;
+
+$router->post('/users/{user}', function (Request $request, string $user): string {
+    $trace = $request->header('x-request-id');
+    $name = $request->input('name');
+
+    return "Updated {$user}";
+});
+```
+
+Request data remains explicit:
+
+```php
+$request->header('authorization'); // case-insensitive
+$request->json('email');
+$request->cookie('session');
+$request->file('avatar');
+$request->rawBody();
+$request->input('name');            // query, form, then JSON
+```
+
+JSON is recognized for `application/json` and `+json` content types. Invalid JSON produces a safe `400 Bad Request` response. Nested PHP uploads are normalized into `UploadedFile` objects while preserving their original keys.
+
+An uploaded file exposes its client filename, client-provided media type, temporary path, upload error, and size. Call `isValid()` before `moveTo($destination)`. The destination directory must already exist and existing files are never overwritten. Client filenames and media types are untrusted input; applications should generate storage names and inspect file contents independently.
+
+## Middleware
+
+Middleware can inspect a request, return a response immediately, or delegate to the next handler. The first registered middleware is the outermost layer:
+
+```php
+use Meulah\Http\Middleware;
+use Meulah\Http\Request;
+use Meulah\Http\RequestHandler;
+use Meulah\Http\Response;
+
+final class AddRequestHeader implements Middleware
+{
+    public function process(Request $request, RequestHandler $next): Response
+    {
+        $response = $next->handle($request);
+
+        return $response->withHeader('X-Framework', 'Meulah');
+    }
+}
+```
+
+Register middleware for every request in `bootstrap.php`:
+
+```php
+$app->middleware(new AddRequestHeader());
+```
+
+Or attach middleware to one route:
+
+```php
+$router
+    ->get('/account', $accountHandler)
+    ->middleware(new RequireAuthentication());
+```
+
+Middleware must return a `Response`. It may short-circuit the pipeline without calling `$next`, which is useful for authentication, authorization, maintenance mode, CORS preflight, and rate limiting. Exceptions thrown anywhere in the pipeline are rendered by Meulah's configured exception handler.
+
 ## Configuration
 
 Configuration files live in `config/` and return plain PHP arrays. They are loaded into a small repository with dot-notation and strict typed access:

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Meulah\Exception;
 
 use Meulah\Http\Response;
+use Meulah\Http\BadRequest;
 use Meulah\Log\Logger;
 use Meulah\Routing\MethodNotAllowed;
 use Meulah\Routing\RouteNotFound;
@@ -20,6 +21,10 @@ final class ExceptionHandler
 
     public function render(Throwable $exception): Response
     {
+        if ($exception instanceof BadRequest) {
+            return Response::html('<h1>400</h1><p>Bad request.</p>', 400);
+        }
+
         if ($exception instanceof MethodNotAllowed) {
             return new Response('Method Not Allowed', 405, [
                 'Allow' => implode(', ', $exception->allowedMethods),
@@ -57,4 +62,3 @@ final class ExceptionHandler
         );
     }
 }
-

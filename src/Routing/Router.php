@@ -5,29 +5,35 @@ declare(strict_types=1);
 namespace Meulah\Routing;
 
 use InvalidArgumentException;
+use Meulah\Http\CallableRequestHandler;
+use Meulah\Http\MiddlewarePipeline;
 use Meulah\Http\Request;
+use Meulah\Http\Response;
+use ReflectionFunction;
+use ReflectionNamedType;
+use UnexpectedValueException;
 
 final class Router
 {
     /** @var list<Route> */
     private array $routes = [];
 
-    public function get(string $path, callable|array|string $handler, ?string $name = null): self
+    public function get(string $path, callable|array|string $handler, ?string $name = null): Route
     {
         return $this->add(['GET', 'HEAD'], $path, $handler, $name);
     }
 
-    public function post(string $path, callable|array|string $handler, ?string $name = null): self
+    public function post(string $path, callable|array|string $handler, ?string $name = null): Route
     {
         return $this->add(['POST'], $path, $handler, $name);
     }
 
-    public function match(array $methods, string $path, callable|array|string $handler, ?string $name = null): self
+    public function match(array $methods, string $path, callable|array|string $handler, ?string $name = null): Route
     {
         return $this->add($methods, $path, $handler, $name);
     }
 
-    public function dispatch(Request $request): mixed
+    public function dispatch(Request $request): Response
     {
         $allowed = [];
 
@@ -44,7 +50,14 @@ final class Router
             }
 
             $handler = $this->resolveHandler($route->handler);
-            return $handler(...array_values($parameters));
+            $destination = new CallableRequestHandler(
+                fn (Request $request): Response => $this->toResponse(
+                    $this->invokeHandler($handler, $request, array_values($parameters)),
+                ),
+            );
+            $response = (new MiddlewarePipeline($route->middlewareStack(), $destination))->handle($request);
+
+            return $request->method() === 'HEAD' ? $response->withoutBody() : $response;
         }
 
         if ($allowed !== []) {
@@ -60,7 +73,7 @@ final class Router
         return $this->routes;
     }
 
-    private function add(array $methods, string $path, callable|array|string $handler, ?string $name): self
+    private function add(array $methods, string $path, callable|array|string $handler, ?string $name): Route
     {
         $methods = array_values(array_unique(array_map('strtoupper', $methods)));
 
@@ -69,9 +82,10 @@ final class Router
         }
 
         $path = '/' . trim($path, '/');
-        $this->routes[] = new Route($methods, $path === '/' ? '/' : rtrim($path, '/'), $handler, $name);
+        $route = new Route($methods, $path === '/' ? '/' : rtrim($path, '/'), $handler, $name);
+        $this->routes[] = $route;
 
-        return $this;
+        return $route;
     }
 
     private function matchPath(string $routePath, string $requestPath): ?array
@@ -103,5 +117,31 @@ final class Router
         }
 
         return $handler;
+    }
+
+    private function toResponse(mixed $result): Response
+    {
+        return match (true) {
+            $result instanceof Response => $result,
+            is_string($result) => Response::html($result),
+            $result === null => new Response(),
+            default => throw new UnexpectedValueException(
+                'Route handlers must return a Response, string, or null.',
+            ),
+        };
+    }
+
+    private function invokeHandler(callable $handler, Request $request, array $parameters): mixed
+    {
+        $reflection = new ReflectionFunction(\Closure::fromCallable($handler));
+        $firstParameter = $reflection->getParameters()[0] ?? null;
+        $type = $firstParameter?->getType();
+        $acceptsRequest = $type instanceof ReflectionNamedType
+            && !$type->isBuiltin()
+            && $type->getName() === Request::class;
+
+        return $acceptsRequest
+            ? $handler($request, ...$parameters)
+            : $handler(...$parameters);
     }
 }

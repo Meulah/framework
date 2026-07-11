@@ -12,7 +12,10 @@ use Meulah\Database\MigrationRepository;
 use Meulah\Database\Migrator;
 use Meulah\Exception\ExceptionHandler;
 use Meulah\Http\Request;
+use Meulah\Http\Middleware;
+use Meulah\Http\RequestHandler;
 use Meulah\Http\Response;
+use Meulah\Http\UploadedFile;
 use Meulah\Log\Logger;
 use Meulah\Routing\MethodNotAllowed;
 use Meulah\Routing\RouteNotFound;
@@ -68,6 +71,103 @@ $test('captured requests hide the internal rewrite parameter', static function (
     }
 });
 
+$test('request exposes headers JSON cookies and files', static function () use ($assertSame): void {
+    $upload = new UploadedFile('avatar.png', 'image/png', 'C:/tmp/upload', UPLOAD_ERR_OK, 2048);
+    $request = new Request(
+        'POST',
+        '/profile',
+        ['source' => 'query'],
+        ['name' => 'form-name'],
+        [],
+        ['Content-Type' => 'application/vnd.api+json; charset=UTF-8', 'X-Trace' => 'abc123'],
+        ['session' => 'cookie-value'],
+        ['avatar' => $upload],
+        '{"name":"json-name","active":true}',
+    );
+
+    $assertSame('abc123', $request->header('x-trace'));
+    $assertSame('application/vnd.api+json; charset=UTF-8', $request->header('CONTENT-TYPE'));
+    $assertSame('cookie-value', $request->cookie('session'));
+    $assertSame($upload, $request->file('avatar'));
+    $assertSame('{"name":"json-name","active":true}', $request->rawBody());
+    $assertSame(true, $request->json('active'));
+    $assertSame('json-name', $request->input('name'));
+    $assertSame('query', $request->input('source'));
+});
+
+$test('captured requests normalize nested PHP uploads', static function () use ($assertSame): void {
+    $originalGet = $_GET;
+    $originalPost = $_POST;
+    $originalCookie = $_COOKIE;
+    $originalFiles = $_FILES;
+    $originalServer = $_SERVER;
+
+    try {
+        $_GET = ['url' => 'upload'];
+        $_POST = [];
+        $_COOKIE = ['theme' => 'dark'];
+        $_FILES = [
+            'documents' => [
+                'name' => ['first.txt', 'second.txt'],
+                'type' => ['text/plain', 'text/plain'],
+                'tmp_name' => ['C:/tmp/first', 'C:/tmp/second'],
+                'error' => [UPLOAD_ERR_OK, UPLOAD_ERR_NO_FILE],
+                'size' => [10, 0],
+            ],
+        ];
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_SERVER['HTTP_X_REQUEST_ID'] = 'request-1';
+        $request = Request::capture();
+        $documents = $request->file('documents');
+
+        $assertSame('request-1', $request->header('x-request-id'));
+        $assertSame('dark', $request->cookie('theme'));
+        $assertSame('first.txt', $documents[0]->clientFilename());
+        $assertSame(UPLOAD_ERR_NO_FILE, $documents[1]->error());
+    } finally {
+        $_GET = $originalGet;
+        $_POST = $originalPost;
+        $_COOKIE = $originalCookie;
+        $_FILES = $originalFiles;
+        $_SERVER = $originalServer;
+    }
+});
+
+$test('malformed JSON is rendered as a bad request', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->post('/json', static function (Request $request): string {
+        $request->json();
+        return 'ok';
+    });
+    $application = new Application($router);
+    $request = new Request(
+        'POST',
+        '/json',
+        headers: ['Content-Type' => 'application/json'],
+        rawBody: '{broken',
+    );
+
+    $response = $application->handle($request);
+
+    $assertSame(400, $response->status());
+    $assertSame(false, str_contains($response->content(), '{broken'));
+});
+
+$test('route handlers can receive the request before path parameters', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->get('/articles/{article}', static function (Request $request, string $article): string {
+        return $request->header('x-language') . ':' . $article;
+    });
+
+    $response = $router->dispatch(new Request(
+        'GET',
+        '/articles/42',
+        headers: ['X-Language' => 'en'],
+    ));
+
+    $assertSame('en:42', $response->content());
+});
+
 $test('router dispatches static routes', static function () use ($assertSame): void {
     $router = new Router();
     $router->get('/health', static fn (): Response => new Response('ok'));
@@ -81,7 +181,10 @@ $test('router passes decoded route parameters', static function () use ($assertS
     $router = new Router();
     $router->get('/users/{user}', static fn (string $user): string => $user);
 
-    $assertSame('Ada Lovelace', $router->dispatch(new Request('GET', '/users/Ada%20Lovelace')));
+    $assertSame(
+        'Ada Lovelace',
+        $router->dispatch(new Request('GET', '/users/Ada%20Lovelace'))->content(),
+    );
 });
 
 $test('router distinguishes method mismatch from missing route', static function (): void {
@@ -129,6 +232,102 @@ $test('HEAD responses never include a body', static function () use ($assertSame
     $assertSame('text/html; charset=UTF-8', $response->headers()['Content-Type']);
 });
 
+$test('global and route middleware run in registration order', static function () use ($assertSame): void {
+    $events = new ArrayObject();
+    $makeMiddleware = static function (string $name) use ($events): Middleware {
+        return new class($name, $events) implements Middleware {
+            public function __construct(
+                private readonly string $name,
+                private readonly ArrayObject $events,
+            ) {
+            }
+
+            public function process(Request $request, RequestHandler $next): Response
+            {
+                $this->events[] = $this->name . ':before';
+                $response = $next->handle($request);
+                $this->events[] = $this->name . ':after';
+                return $response->withHeader('X-' . $this->name, 'applied');
+            }
+        };
+    };
+
+    $router = new Router();
+    $route = $router->get('/middleware', static function () use ($events): string {
+        $events[] = 'handler';
+        return 'ok';
+    });
+    $route->middleware($makeMiddleware('Route'));
+    $application = new Application($router);
+    $application->middleware($makeMiddleware('First'), $makeMiddleware('Second'));
+
+    $response = $application->handle(new Request('GET', '/middleware'));
+
+    $assertSame([
+        'First:before',
+        'Second:before',
+        'Route:before',
+        'handler',
+        'Route:after',
+        'Second:after',
+        'First:after',
+    ], $events->getArrayCopy());
+    $assertSame('applied', $response->headers()['X-First']);
+    $assertSame('applied', $response->headers()['X-Route']);
+});
+
+$test('middleware can short circuit before a route handler', static function () use ($assertSame): void {
+    $handled = false;
+    $router = new Router();
+    $router->get('/private', static function () use (&$handled): string {
+        $handled = true;
+        return 'private';
+    });
+    $application = new Application($router);
+    $application->middleware(new class implements Middleware {
+        public function process(Request $request, RequestHandler $next): Response
+        {
+            return Response::html('Forbidden', 403);
+        }
+    });
+
+    $response = $application->handle(new Request('GET', '/private'));
+
+    $assertSame(403, $response->status());
+    $assertSame('Forbidden', $response->content());
+    $assertSame(false, $handled);
+});
+
+$test('middleware exceptions use the configured exception handler', static function () use ($assertSame): void {
+    $logger = new class implements Logger {
+        public int $errors = 0;
+
+        public function error(Throwable $exception): void
+        {
+            $this->errors++;
+        }
+    };
+    $router = new Router();
+    $router->get('/', static fn (): string => 'home');
+    $application = new Application(
+        $router,
+        new Repository(),
+        new ExceptionHandler(false, $logger),
+    );
+    $application->middleware(new class implements Middleware {
+        public function process(Request $request, RequestHandler $next): Response
+        {
+            throw new RuntimeException('Middleware failed.');
+        }
+    });
+
+    $response = $application->handle(new Request('GET', '/'));
+
+    $assertSame(500, $response->status());
+    $assertSame(1, $logger->errors);
+    $assertSame(false, str_contains($response->content(), 'Middleware failed.'));
+});
+
 $test('responses reject invalid status codes and headers early', static function (): void {
     try {
         new Response('', 700);
@@ -141,6 +340,13 @@ $test('responses reject invalid status codes and headers early', static function
         throw new RuntimeException('Expected invalid header rejection.');
     } catch (InvalidArgumentException) {
     }
+});
+
+$test('response header replacement is case insensitive', static function () use ($assertSame): void {
+    $response = (new Response('', 200, ['X-Trace' => 'first']))
+        ->withHeader('x-trace', 'second');
+
+    $assertSame(['x-trace' => 'second'], $response->headers());
 });
 
 $test('configuration supports nested values and strict types', static function () use ($assertSame): void {

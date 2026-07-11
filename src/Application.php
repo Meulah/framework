@@ -6,17 +6,21 @@ namespace Meulah;
 
 use Meulah\Config\Repository;
 use Meulah\Exception\ExceptionHandler;
+use Meulah\Http\CallableRequestHandler;
+use Meulah\Http\Middleware;
+use Meulah\Http\MiddlewarePipeline;
 use Meulah\Http\Request;
 use Meulah\Http\Response;
 use Meulah\Log\ErrorLogLogger;
 use Meulah\Routing\Router;
-use UnexpectedValueException;
 use Throwable;
 
 final class Application
 {
     private readonly Repository $config;
     private readonly ExceptionHandler $exceptions;
+    /** @var list<Middleware> */
+    private array $middleware = [];
 
     public function __construct(
         private readonly Router $router,
@@ -37,19 +41,19 @@ final class Application
         return $this->config;
     }
 
+    public function middleware(Middleware ...$middleware): self
+    {
+        array_push($this->middleware, ...$middleware);
+        return $this;
+    }
+
     public function handle(Request $request): Response
     {
         try {
-            $result = $this->router->dispatch($request);
-
-            $response = match (true) {
-                $result instanceof Response => $result,
-                is_string($result) => Response::html($result),
-                $result === null => new Response(),
-                default => throw new UnexpectedValueException(
-                    'Route handlers must return a Response, string, or null.',
-                ),
-            };
+            $destination = new CallableRequestHandler(
+                fn (Request $request): Response => $this->router->dispatch($request),
+            );
+            $response = (new MiddlewarePipeline($this->middleware, $destination))->handle($request);
 
             return $request->method() === 'HEAD' ? $response->withoutBody() : $response;
         } catch (Throwable $exception) {

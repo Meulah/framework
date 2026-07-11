@@ -17,8 +17,10 @@ $debug = $config->bool('app.debug');
 error_reporting(E_ALL);
 ini_set('display_errors', $debug ? '1' : '0');
 
-return new Application(
+$app = new Application(
     new Router(),
     $config,
     new ExceptionHandler($debug, new ErrorLogLogger()),
 );
+
+return $app;
