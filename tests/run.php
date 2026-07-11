@@ -6,6 +6,9 @@ use Meulah\Application;
 use Meulah\Config\Repository;
 use Meulah\Database\Connection;
 use Meulah\Database\Migration;
+use Meulah\Database\MigrationFinder;
+use Meulah\Database\MigrationFile;
+use Meulah\Database\MigrationRepository;
 use Meulah\Database\Migrator;
 use Meulah\Exception\ExceptionHandler;
 use Meulah\Http\Request;
@@ -213,7 +216,7 @@ $test('view renderer isolates rendering behind a configured path', static functi
     $assertSame('Hello, Meulah!', trim($views->render('greeting', ['name' => 'Meulah'])));
 });
 
-$test('database connection executes migrations transactionally', static function () use ($assertSame): void {
+$test('migration contract applies and reverses schema changes', static function () use ($assertSame): void {
     if (!in_array('sqlite', \PDO::getAvailableDrivers(), true)) {
         return;
     }
@@ -236,6 +239,91 @@ $test('database connection executes migrations transactionally', static function
     $migrator->run($migration);
     $assertSame(1, $connection->scalar('SELECT COUNT(*) FROM notes'));
     $migrator->rollback($migration);
+});
+
+$test('database factory selects SQLite and enables foreign keys', static function () use ($assertSame): void {
+    if (!in_array('sqlite', \PDO::getAvailableDrivers(), true)) {
+        return;
+    }
+
+    $connection = Connection::fromConfig([
+        'driver' => 'sqlite',
+        'path' => ':memory:',
+    ]);
+
+    $assertSame(1, $connection->scalar('PRAGMA foreign_keys'));
+});
+
+$test('database factory rejects unknown drivers', static function (): void {
+    try {
+        Connection::fromConfig(['driver' => 'oracle']);
+        throw new RuntimeException('Expected unsupported driver rejection.');
+    } catch (InvalidArgumentException) {
+    }
+});
+
+$test('migrations are discovered tracked and rolled back by batch', static function () use ($assertSame): void {
+    if (!in_array('sqlite', \PDO::getAvailableDrivers(), true)) {
+        return;
+    }
+
+    $connection = Connection::fromConfig(['driver' => 'sqlite', 'path' => ':memory:']);
+    $repository = new MigrationRepository($connection, 'test_migrations');
+    $migrator = new Migrator($connection, $repository);
+    $migrations = (new MigrationFinder())->discover(__DIR__ . '/fixtures/migrations');
+
+    $assertSame([
+        '2026_01_01_000001_create_alpha',
+        '2026_01_01_000002_create_beta',
+    ], array_map(static fn ($file): string => $file->name, $migrations));
+    $assertSame(['Pending', 'Pending'], array_column($migrator->status($migrations), 'status'));
+
+    $assertSame([
+        '2026_01_01_000001_create_alpha',
+        '2026_01_01_000002_create_beta',
+    ], $migrator->migrate($migrations));
+    $assertSame([], $migrator->migrate($migrations));
+    $assertSame(['Ran', 'Ran'], array_column($migrator->status($migrations), 'status'));
+    $assertSame([1, 1], array_column($migrator->status($migrations), 'batch'));
+    $assertSame(
+        ['Ran', 'Missing'],
+        array_column($migrator->status([$migrations[0]]), 'status'),
+    );
+
+    $assertSame([
+        '2026_01_01_000002_create_beta',
+        '2026_01_01_000001_create_alpha',
+    ], $migrator->rollbackLast($migrations));
+    $assertSame([], $repository->records());
+});
+
+$test('failed migrations are not written to history', static function () use ($assertSame): void {
+    if (!in_array('sqlite', \PDO::getAvailableDrivers(), true)) {
+        return;
+    }
+
+    $connection = Connection::fromConfig(['driver' => 'sqlite', 'path' => ':memory:']);
+    $repository = new MigrationRepository($connection, 'failed_migrations');
+    $migrator = new Migrator($connection, $repository);
+    $migration = new class implements Migration {
+        public function up(Connection $connection): void
+        {
+            throw new RuntimeException('Migration failed.');
+        }
+
+        public function down(Connection $connection): void
+        {
+        }
+    };
+
+    try {
+        $migrator->migrate([new MigrationFile('broken_migration', __FILE__, $migration)]);
+        throw new RuntimeException('Expected migration failure.');
+    } catch (RuntimeException $exception) {
+        $assertSame('Migration failed.', $exception->getMessage());
+    }
+
+    $assertSame([], $repository->records());
 });
 
 $test('database identifiers are strictly validated', static function () use ($assertSame): void {

@@ -45,6 +45,64 @@ $database = $app->config()->array('database');
 
 Environment-specific values belong in the ignored root `.env`. `.env.example` documents the available variables and is safe to commit.
 
+## Database drivers
+
+Meulah supports MySQL, PostgreSQL, and SQLite through PDO. Select the driver in `.env`:
+
+```ini
+DB_DRIVER=mysql
+```
+
+Use `pgsql` or `postgresql` for PostgreSQL and `sqlite` for SQLite. Applications create a connection from the loaded configuration:
+
+```php
+use Meulah\Database\Connection;
+
+$connection = Connection::fromConfig($app->config()->array('database'));
+```
+
+MySQL uses port `3306` by default and PostgreSQL uses `5432`. SQLite reads `DB_PATH`; relative paths are resolved from the project root, while `:memory:` creates an in-memory database. The selected PDO driver (`pdo_mysql`, `pdo_pgsql`, or `pdo_sqlite`) must be installed.
+
+## Migrations
+
+Migration files live in `database/migrations` by default, are ordered by filename, and return an object implementing `Meulah\Database\Migration`:
+
+```php
+<?php
+
+use Meulah\Database\Connection;
+use Meulah\Database\Migration;
+
+return new class implements Migration {
+    public function up(Connection $connection): void
+    {
+        $connection->execute(
+            'CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255) NOT NULL)'
+        );
+    }
+
+    public function down(Connection $connection): void
+    {
+        $connection->execute('DROP TABLE users');
+    }
+};
+```
+
+Create and manage migrations with the dependency-free CLI:
+
+```bash
+php bin/meulah make:migration create_users
+php bin/meulah migrate
+php bin/meulah migrate:status
+php bin/meulah migrate:rollback
+```
+
+`migrate` runs only files not recorded in the migration history table. All migrations from one invocation share a batch number, and `migrate:rollback` reverses the most recent batch in reverse filename order. A recorded migration whose file has been removed appears as `Missing` in the status output.
+
+Use `--path=some/directory` to override the configured directory. `DB_MIGRATIONS` and `DB_MIGRATION_TABLE` configure the defaults. Migration SQL remains intentionally explicit, so applications that support multiple database engines should use SQL compatible with each selected engine.
+
+Schema migrations are not automatically wrapped in transactions because MySQL implicitly commits many DDL statements. A migration is added to history only after its `up()` method completes successfully.
+
 ## Errors and logging
 
 Routing failures are rendered as `404` and `405` responses. Unexpected exceptions are logged through the `Meulah\Log\Logger` interface and rendered by `Meulah\Exception\ExceptionHandler`.

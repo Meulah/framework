@@ -7,6 +7,7 @@ namespace Meulah\Database;
 use InvalidArgumentException;
 use PDO;
 use PDOStatement;
+use RuntimeException;
 
 final class Connection
 {
@@ -19,6 +20,8 @@ final class Connection
 
     public static function mysql(array $config): self
     {
+        self::requireDriver('mysql');
+
         $host = $config['host'] ?? '127.0.0.1';
         $port = (int) ($config['port'] ?? 3306);
         $database = $config['database'] ?? '';
@@ -30,6 +33,45 @@ final class Connection
             (string) ($config['username'] ?? ''),
             (string) ($config['password'] ?? ''),
         ));
+    }
+
+    public static function postgresql(array $config): self
+    {
+        self::requireDriver('pgsql');
+
+        $host = $config['host'] ?? '127.0.0.1';
+        $port = (int) ($config['port'] ?? 5432);
+        $database = $config['database'] ?? '';
+        $dsn = "pgsql:host={$host};port={$port};dbname={$database}";
+
+        return new self(new PDO(
+            $dsn,
+            (string) ($config['username'] ?? ''),
+            (string) ($config['password'] ?? ''),
+        ));
+    }
+
+    public static function sqlite(array $config): self
+    {
+        self::requireDriver('sqlite');
+
+        $path = (string) ($config['path'] ?? $config['database'] ?? ':memory:');
+        $connection = new self(new PDO('sqlite:' . $path));
+        $connection->execute('PRAGMA foreign_keys = ON');
+
+        return $connection;
+    }
+
+    public static function fromConfig(array $config): self
+    {
+        $driver = strtolower((string) ($config['driver'] ?? 'mysql'));
+
+        return match ($driver) {
+            'mysql' => self::mysql($config),
+            'pgsql', 'postgres', 'postgresql' => self::postgresql($config),
+            'sqlite' => self::sqlite($config),
+            default => throw new InvalidArgumentException("Unsupported database driver: {$driver}"),
+        };
     }
 
     public function pdo(): PDO
@@ -90,5 +132,14 @@ final class Connection
 
         return $identifier;
     }
-}
 
+    private static function requireDriver(string $driver): void
+    {
+        if (!in_array($driver, PDO::getAvailableDrivers(), true)) {
+            throw new RuntimeException(
+                "PDO driver '{$driver}' is not installed. Available drivers: " .
+                (implode(', ', PDO::getAvailableDrivers()) ?: 'none'),
+            );
+        }
+    }
+}

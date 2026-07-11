@@ -12,6 +12,14 @@
             "Meulah\\": "src/"
         }
     },
+    "bin": [
+        "bin/meulah"
+    ],
+    "suggest": {
+        "ext-pdo_mysql": "Required when using the MySQL database driver.",
+        "ext-pdo_pgsql": "Required when using the PostgreSQL database driver.",
+        "ext-pdo_sqlite": "Required when using the SQLite database driver."
+    },
     "scripts": {
         "test": "php tests/run.php"
     },
