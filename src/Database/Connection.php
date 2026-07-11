@@ -79,6 +79,11 @@ final class Connection
         return $this->pdo;
     }
 
+    public function driver(): string
+    {
+        return (string) $this->pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+    }
+
     public function execute(string $sql, array $parameters = []): PDOStatement
     {
         $statement = $this->pdo->prepare($sql);
@@ -124,6 +129,43 @@ final class Connection
         }
     }
 
+    public function dropAllTables(): void
+    {
+        $driver = $this->driver();
+
+        $tables = match ($driver) {
+            'mysql' => $this->execute(
+                "SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'",
+            )->fetchAll(PDO::FETCH_COLUMN),
+            'pgsql' => $this->execute(
+                'SELECT tablename FROM pg_tables WHERE schemaname = current_schema()',
+            )->fetchAll(PDO::FETCH_COLUMN),
+            'sqlite' => $this->execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )->fetchAll(PDO::FETCH_COLUMN),
+            default => throw new RuntimeException("Dropping tables is not supported for PDO driver: {$driver}"),
+        };
+
+        if ($driver === 'mysql') {
+            $this->execute('SET FOREIGN_KEY_CHECKS = 0');
+        } elseif ($driver === 'sqlite') {
+            $this->execute('PRAGMA foreign_keys = OFF');
+        }
+
+        try {
+            foreach ($tables as $table) {
+                $cascade = $driver === 'pgsql' ? ' CASCADE' : '';
+                $this->execute('DROP TABLE ' . $this->quoteIdentifier((string) $table) . $cascade);
+            }
+        } finally {
+            if ($driver === 'mysql') {
+                $this->execute('SET FOREIGN_KEY_CHECKS = 1');
+            } elseif ($driver === 'sqlite') {
+                $this->execute('PRAGMA foreign_keys = ON');
+            }
+        }
+    }
+
     public static function identifier(string $identifier): string
     {
         if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $identifier) !== 1) {
@@ -131,6 +173,15 @@ final class Connection
         }
 
         return $identifier;
+    }
+
+    public function quoteIdentifier(string $identifier): string
+    {
+        return match ($this->driver()) {
+            'mysql' => '`' . str_replace('`', '``', $identifier) . '`',
+            'pgsql', 'sqlite' => '"' . str_replace('"', '""', $identifier) . '"',
+            default => throw new RuntimeException('Identifier quoting is not supported by this driver.'),
+        };
     }
 
     private static function requireDriver(string $driver): void

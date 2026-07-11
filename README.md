@@ -91,15 +91,23 @@ return new class implements Migration {
 Create and manage migrations with the dependency-free CLI:
 
 ```bash
-php bin/meulah make:migration create_users
-php bin/meulah migrate
-php bin/meulah migrate:status
-php bin/meulah migrate:rollback
+php meulah make:migration create_users_table
+php meulah migrate
+php meulah migrate:status
+php meulah migrate:rollback
+php meulah migrate:reset
+php meulah migrate:fresh
 ```
 
-`migrate` runs only files not recorded in the migration history table. All migrations from one invocation share a batch number, and `migrate:rollback` reverses the most recent batch in reverse filename order. A recorded migration whose file has been removed appears as `Missing` in the status output.
+The root `meulah` launcher delegates to the internal `bin/meulah` executable. `migrate` runs only files not recorded in the migration history table. All migrations from one invocation share a batch number, and `migrate:rollback` reverses the most recent batch in reverse filename order. `migrate:reset` rolls back every recorded batch. `migrate:fresh` drops every table—including tables not managed by migrations—and then reruns all migrations. A recorded migration whose file has been removed appears as `Missing` in the status output.
 
 Use `--path=some/directory` to override the configured directory. `DB_MIGRATIONS` and `DB_MIGRATION_TABLE` configure the defaults. Migration SQL remains intentionally explicit, so applications that support multiple database engines should use SQL compatible with each selected engine.
+
+Rollback, reset, and fresh commands require `--force` when `APP_ENV=production`:
+
+```bash
+php meulah migrate:fresh --force
+```
 
 Schema migrations are not automatically wrapped in transactions because MySQL implicitly commits many DDL statements. A migration is added to history only after its `up()` method completes successfully.
 

@@ -76,6 +76,25 @@ final class Migrator
         return $rolledBack;
     }
 
+    /** @param list<MigrationFile> $migrations @return list<string> */
+    public function reset(array $migrations): array
+    {
+        $rolledBack = [];
+
+        while (($batch = $this->rollbackLast($migrations)) !== []) {
+            array_push($rolledBack, ...$batch);
+        }
+
+        return $rolledBack;
+    }
+
+    /** @param list<MigrationFile> $migrations @return list<string> */
+    public function fresh(array $migrations): array
+    {
+        $this->connection->dropAllTables();
+        return $this->migrate($migrations);
+    }
+
     /** @param list<MigrationFile> $migrations @return list<array{name: string, status: string, batch: int|null}> */
     public function status(array $migrations): array
     {

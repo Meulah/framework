@@ -28,6 +28,8 @@ final class Application
                 'migrate' => $this->migrate($options),
                 'migrate:status' => $this->status($options),
                 'migrate:rollback' => $this->rollback($options),
+                'migrate:reset' => $this->reset($options),
+                'migrate:fresh' => $this->fresh($options),
                 'make:migration' => $this->makeMigration($values[0] ?? '', $options),
                 'help', '--help', '-h' => $this->help(),
                 default => throw new RuntimeException("Unknown command: {$command}"),
@@ -57,7 +59,9 @@ final class Application
 
     private function rollback(array $options): int
     {
-        [$migrator, $migrations] = $this->context($options);
+        $kernel = $this->kernel();
+        $this->assertDestructiveCommandAllowed($kernel, $options);
+        [$migrator, $migrations] = $this->context($options, $kernel);
         $rolledBack = $migrator->rollbackLast($migrations);
 
         if ($rolledBack === []) {
@@ -67,6 +71,46 @@ final class Application
 
         foreach ($rolledBack as $name) {
             fwrite(STDOUT, "Rolled back: {$name}" . PHP_EOL);
+        }
+
+        return 0;
+    }
+
+    private function reset(array $options): int
+    {
+        $kernel = $this->kernel();
+        $this->assertDestructiveCommandAllowed($kernel, $options);
+        [$migrator, $migrations] = $this->context($options, $kernel);
+        $rolledBack = $migrator->reset($migrations);
+
+        if ($rolledBack === []) {
+            fwrite(STDOUT, 'Nothing to reset.' . PHP_EOL);
+            return 0;
+        }
+
+        foreach ($rolledBack as $name) {
+            fwrite(STDOUT, "Rolled back: {$name}" . PHP_EOL);
+        }
+
+        return 0;
+    }
+
+    private function fresh(array $options): int
+    {
+        $kernel = $this->kernel();
+        $this->assertDestructiveCommandAllowed($kernel, $options);
+        [$migrator, $migrations] = $this->context($options, $kernel);
+        $completed = $migrator->fresh($migrations);
+
+        fwrite(STDOUT, 'Dropped all tables.' . PHP_EOL);
+
+        if ($completed === []) {
+            fwrite(STDOUT, 'No migrations found.' . PHP_EOL);
+            return 0;
+        }
+
+        foreach ($completed as $name) {
+            fwrite(STDOUT, "Migrated: {$name}" . PHP_EOL);
         }
 
         return 0;
@@ -145,9 +189,9 @@ PHP;
         return 0;
     }
 
-    private function context(array $options): array
+    private function context(array $options, ?Kernel $kernel = null): array
     {
-        $kernel = $this->kernel();
+        $kernel ??= $this->kernel();
         $database = $kernel->config()->array('database');
         $connection = Connection::fromConfig($database);
         $repository = new MigrationRepository(
@@ -158,6 +202,16 @@ PHP;
         $migrations = (new MigrationFinder())->discover($this->migrationPath($options, $kernel));
 
         return [$migrator, $migrations];
+    }
+
+    private function assertDestructiveCommandAllowed(Kernel $kernel, array $options): void
+    {
+        if (
+            $kernel->config()->string('app.environment') === 'production'
+            && !array_key_exists('force', $options)
+        ) {
+            throw new RuntimeException('Destructive migration commands require --force in production.');
+        }
     }
 
     private function kernel(): Kernel
@@ -205,13 +259,15 @@ Commands:
   migrate                Run all pending migrations
   migrate:status         Show migration status
   migrate:rollback       Roll back the last batch
+  migrate:reset          Roll back every migration
+  migrate:fresh          Drop all tables and rerun migrations
 
 Options:
   --path=<directory>     Override the configured migration directory
+  --force                Allow destructive commands in production
 
 TEXT);
 
         return 0;
     }
 }
-

@@ -326,6 +326,39 @@ $test('failed migrations are not written to history', static function () use ($a
     $assertSame([], $repository->records());
 });
 
+$test('migration reset and fresh rebuild the database', static function () use ($assertSame): void {
+    if (!in_array('sqlite', \PDO::getAvailableDrivers(), true)) {
+        return;
+    }
+
+    $connection = Connection::fromConfig(['driver' => 'sqlite', 'path' => ':memory:']);
+    $repository = new MigrationRepository($connection, 'rebuild_migrations');
+    $migrator = new Migrator($connection, $repository);
+    $migrations = (new MigrationFinder())->discover(__DIR__ . '/fixtures/migrations');
+
+    $migrator->migrate([$migrations[0]]);
+    $migrator->migrate($migrations);
+    $assertSame([
+        '2026_01_01_000002_create_beta',
+        '2026_01_01_000001_create_alpha',
+    ], $migrator->reset($migrations));
+    $assertSame([], $repository->records());
+
+    $connection->execute('CREATE TABLE unrelated_data (id INTEGER PRIMARY KEY)');
+    $assertSame([
+        '2026_01_01_000001_create_alpha',
+        '2026_01_01_000002_create_beta',
+    ], $migrator->fresh($migrations));
+    $assertSame(1, $connection->scalar('PRAGMA foreign_keys'));
+    $assertSame(['Ran', 'Ran'], array_column($migrator->status($migrations), 'status'));
+
+    try {
+        $connection->scalar('SELECT COUNT(*) FROM unrelated_data');
+        throw new RuntimeException('Expected fresh migration to drop unrelated tables.');
+    } catch (\PDOException) {
+    }
+});
+
 $test('database identifiers are strictly validated', static function () use ($assertSame): void {
     $assertSame('users', Connection::identifier('users'));
 

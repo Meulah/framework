@@ -7,3 +7,4 @@ composer.lock text eol=lf
 *.htaccess text eol=lf
 *.example text eol=lf
 bin/* text eol=lf
+meulah text eol=lf
