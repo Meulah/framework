@@ -618,7 +618,7 @@ $test('router passes decoded route parameters', static function () use ($assertS
 
 $test('router distinguishes method mismatch from missing route', static function (): void {
     $router = new Router();
-    $router->post('/messages', static fn (): null => null);
+    $router->post('/messages', static fn (): mixed => null);
 
     try {
         $router->dispatch(new Request('GET', '/messages'));
