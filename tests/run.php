@@ -3,7 +3,10 @@
 declare(strict_types=1);
 
 use Meulah\Application;
+use Meulah\Container\BindingResolutionException;
+use Meulah\Container\Container;
 use Meulah\Config\Repository;
+use Meulah\Console\ProjectRoot;
 use Meulah\Database\Connection;
 use Meulah\Database\Migration;
 use Meulah\Database\MigrationFinder;
@@ -25,10 +28,18 @@ use Meulah\Routing\MethodNotAllowed;
 use Meulah\Routing\RouteNotFound;
 use Meulah\Routing\RouteHandlerException;
 use Meulah\Routing\Router;
+use Meulah\Routing\UrlGenerationException;
 use Meulah\Support\Environment;
 use Meulah\View\View;
+use Tests\Fixtures\CircularOne;
+use Tests\Fixtures\FriendlyGreeting;
+use Tests\Fixtures\Greeting;
+use Tests\Fixtures\GreetingController;
+use Tests\Fixtures\InvokableGreetingController;
+use Tests\Fixtures\ScalarDependencyController;
 
 require __DIR__ . '/bootstrap.php';
+require __DIR__ . '/fixtures/ContainerFixtures.php';
 
 $tests = [];
 
@@ -353,6 +364,82 @@ $test('route handlers can receive the request before path parameters', static fu
     $assertSame('en:42', $response->content());
 });
 
+$test('controllers receive constructor dependencies from the container', static function () use ($assertSame): void {
+    $container = new Container();
+    $container->singleton(Greeting::class, FriendlyGreeting::class);
+    $router = new Router($container);
+    $application = new Application($router, new Repository(['app' => ['name' => 'Meulah']]));
+    $router->get('/hello/{name}', [GreetingController::class, 'show']);
+
+    $response = $application->handle(new Request('GET', '/hello/Ada'));
+
+    $assertSame('Meulah: Hello, Ada!', $response->content());
+    $assertSame($container, $application->container());
+    $assertSame($router, $container->get(Router::class));
+});
+
+$test('invokable controller class strings are container resolved', static function () use ($assertSame): void {
+    $container = new Container();
+    $container->bind(Greeting::class, FriendlyGreeting::class);
+    $router = new Router($container);
+    $router->post('/hello', InvokableGreetingController::class);
+
+    $response = $router->dispatch(new Request('POST', '/hello', body: ['name' => 'Grace']));
+
+    $assertSame('Hello, Grace!', $response->content());
+});
+
+$test('container distinguishes transient singleton and instance lifetimes', static function () use ($assertSame): void {
+    $container = new Container();
+    $container->bind(FriendlyGreeting::class);
+    $firstTransient = $container->get(FriendlyGreeting::class);
+    $secondTransient = $container->get(FriendlyGreeting::class);
+    $assertSame(false, $firstTransient === $secondTransient);
+
+    $container->singleton(Greeting::class, static fn (Container $container): FriendlyGreeting => new FriendlyGreeting());
+    $assertSame($container->get(Greeting::class), $container->get(Greeting::class));
+
+    $known = new FriendlyGreeting();
+    $container->instance(Greeting::class, $known);
+    $assertSame($known, $container->get(Greeting::class));
+});
+
+$test('container rejects incompatible registered instances', static function () use ($assertSame): void {
+    try {
+        (new Container())->instance(Greeting::class, new stdClass());
+        throw new RuntimeException('Expected incompatible instance rejection.');
+    } catch (BindingResolutionException $exception) {
+        $assertSame(
+            "Instance for 'Tests\\Fixtures\\Greeting' has incompatible type 'stdClass'.",
+            $exception->getMessage(),
+        );
+    }
+});
+
+$test('container rejects unresolved scalar dependencies', static function () use ($assertSame): void {
+    try {
+        (new Container())->get(ScalarDependencyController::class);
+        throw new RuntimeException('Expected scalar dependency rejection.');
+    } catch (BindingResolutionException $exception) {
+        $assertSame(
+            "Cannot resolve parameter '\$apiKey' (string) while constructing 'Tests\\Fixtures\\ScalarDependencyController'.",
+            $exception->getMessage(),
+        );
+    }
+});
+
+$test('container reports circular dependency chains', static function () use ($assertSame): void {
+    try {
+        (new Container())->get(CircularOne::class);
+        throw new RuntimeException('Expected circular dependency rejection.');
+    } catch (BindingResolutionException $exception) {
+        $assertSame(
+            'Circular dependency detected: Tests\\Fixtures\\CircularOne -> Tests\\Fixtures\\CircularTwo -> Tests\\Fixtures\\CircularOne.',
+            $exception->getMessage(),
+        );
+    }
+});
+
 $test('route handler injection is strict and reports argument mismatches', static function () use ($assertSame): void {
     $router = new Router();
     $router->get('/users/{user}', static fn ($request, string $user): string => $user);
@@ -372,6 +459,114 @@ $test('router dispatches static routes', static function () use ($assertSame): v
     $response = $router->dispatch(new Request('GET', '/health'));
 
     $assertSame('ok', $response->content());
+});
+
+$test('named routes generate encoded paths and RFC 3986 query strings', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->get(
+        '/teams/{team}/users/{user}',
+        static fn (string $team, string $user): string => $team . ':' . $user,
+        'users.show',
+    );
+
+    $url = $router->url(
+        'users.show',
+        ['team' => 'Core Team', 'user' => 'Ada Lovelace'],
+        ['tab' => 'account settings', 'filter' => ['active' => true]],
+    );
+
+    $assertSame(
+        '/teams/Core%20Team/users/Ada%20Lovelace?tab=account%20settings&filter%5Bactive%5D=1',
+        $url,
+    );
+});
+
+$test('generated path values are decoded exactly once during dispatch', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->get('/references/{reference}', static fn (string $reference): string => $reference, 'references.show');
+    $path = $router->url('references.show', ['reference' => '%2F']);
+
+    $assertSame('/references/%252F', $path);
+    $assertSame('%2F', $router->dispatch(new Request('GET', $path))->content());
+});
+
+$test('named route generation requires the exact path parameter set', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->get('/articles/{article}', static fn (): string => 'article', 'articles.show');
+
+    try {
+        $router->url('articles.show');
+        throw new RuntimeException('Expected missing route parameter rejection.');
+    } catch (UrlGenerationException $exception) {
+        $assertSame(
+            "Cannot generate route 'articles.show'; missing path parameters: article.",
+            $exception->getMessage(),
+        );
+    }
+
+    try {
+        $router->url('articles.show', ['article' => 42, 'page' => 2]);
+        throw new RuntimeException('Expected unknown route parameter rejection.');
+    } catch (UrlGenerationException $exception) {
+        $assertSame(
+            "Cannot generate route 'articles.show'; unknown path parameters: page.",
+            $exception->getMessage(),
+        );
+    }
+});
+
+$test('named route generation rejects unknown routes and duplicate names', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->get('/first', static fn (): string => 'first', 'shared.name');
+
+    try {
+        $router->url('missing.route');
+        throw new RuntimeException('Expected unknown named route rejection.');
+    } catch (UrlGenerationException $exception) {
+        $assertSame("Named route 'missing.route' does not exist.", $exception->getMessage());
+    }
+
+    try {
+        $router->get('/second', static fn (): string => 'second', 'shared.name');
+        throw new RuntimeException('Expected duplicate route name rejection.');
+    } catch (InvalidArgumentException $exception) {
+        $assertSame("Route name 'shared.name' is already registered.", $exception->getMessage());
+    }
+});
+
+$test('named route path parameters cannot be empty or non-stringable', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->get('/files/{file}', static fn (): string => 'file', 'files.show');
+
+    foreach (['' => 'cannot be empty', 'array' => 'must be scalar or stringable'] as $kind => $message) {
+        $value = $kind === '' ? '' : ['not', 'valid'];
+
+        try {
+            $router->url('files.show', ['file' => $value]);
+            throw new RuntimeException('Expected invalid path parameter rejection.');
+        } catch (UrlGenerationException $exception) {
+            $assertSame(true, str_contains($exception->getMessage(), $message));
+        }
+    }
+
+    try {
+        $router->url('files.show', ['file' => 'reports/annual.pdf']);
+        throw new RuntimeException('Expected slash-containing path parameter rejection.');
+    } catch (UrlGenerationException $exception) {
+        $assertSame(
+            "Path parameter 'file' for route 'files.show' cannot contain a slash.",
+            $exception->getMessage(),
+        );
+    }
+});
+
+$test('route paths reject duplicate parameter names', static function () use ($assertSame): void {
+    try {
+        (new Router())->get('/compare/{item}/{item}', static fn (): string => 'compare');
+        throw new RuntimeException('Expected duplicate path parameter rejection.');
+    } catch (InvalidArgumentException $exception) {
+        $assertSame('Route path parameter names must be unique.', $exception->getMessage());
+    }
 });
 
 $test('routing accepts custom response interface implementations', static function () use ($assertSame): void {
@@ -596,11 +791,91 @@ $test('configuration supports nested values and strict types', static function (
     $assertSame('fallback', $config->get('missing', 'fallback'));
 });
 
-$test('configuration loads root configuration files', static function () use ($assertSame): void {
-    $config = Repository::load(dirname(__DIR__) . '/config');
+$test('configuration loads application configuration files', static function () use ($assertSame): void {
+    $config = Repository::load(__DIR__ . '/fixtures/config');
 
     $assertSame(true, $config->has('app.environment'));
     $assertSame('mysql', $config->string('database.driver'));
+});
+
+$test('project root discovery walks up from an application subdirectory', static function () use ($assertSame): void {
+    $skeleton = realpath(dirname(__DIR__) . '/skeleton');
+
+    if ($skeleton === false) {
+        throw new RuntimeException('Starter skeleton is missing.');
+    }
+
+    $assertSame($skeleton, ProjectRoot::discover($skeleton . '/public'));
+    $assertSame($skeleton, ProjectRoot::discover($skeleton . '/database/migrations'));
+});
+
+$test('project root discovery honors the explicit environment root first', static function () use ($assertSame): void {
+    $key = 'MEULAH_APPLICATION_ROOT';
+    $original = $_ENV[$key] ?? null;
+    $existed = array_key_exists($key, $_ENV);
+    $skeleton = realpath(dirname(__DIR__) . '/skeleton');
+
+    if ($skeleton === false) {
+        throw new RuntimeException('Starter skeleton is missing.');
+    }
+
+    try {
+        $_ENV[$key] = $skeleton;
+        $assertSame($skeleton, ProjectRoot::discover(dirname(__DIR__)));
+    } finally {
+        if ($existed) {
+            $_ENV[$key] = $original;
+        } else {
+            unset($_ENV[$key]);
+        }
+    }
+});
+
+$test('project root discovery rejects unmarked Composer projects', static function () use ($assertSame): void {
+    try {
+        ProjectRoot::explicit(dirname(__DIR__));
+        throw new RuntimeException('Expected unmarked project rejection.');
+    } catch (RuntimeException $exception) {
+        $assertSame(
+            true,
+            str_starts_with($exception->getMessage(), 'Directory is not a marked Meulah application:'),
+        );
+    }
+});
+
+$test('starter skeleton boots its controller route and view', static function () use ($assertSame): void {
+    $root = dirname(__DIR__) . '/skeleton';
+    $autoload = static function (string $className) use ($root): void {
+        $prefix = 'App\\';
+
+        if (!str_starts_with($className, $prefix)) {
+            return;
+        }
+
+        $relativeClass = substr($className, strlen($prefix));
+        $file = $root . '/app/' . str_replace('\\', '/', $relativeClass) . '.php';
+
+        if (is_file($file)) {
+            require_once $file;
+        }
+    };
+
+    spl_autoload_register($autoload);
+
+    try {
+        /** @var Application $application */
+        $application = require $root . '/bootstrap.php';
+        $router = $application->router();
+        require $root . '/routes/web.php';
+
+        $response = $application->handle(new Request('GET', '/'));
+
+        $assertSame(200, $response->status());
+        $assertSame(true, str_contains($response->content(), 'Your Meulah application is ready.'));
+        $assertSame('/', $router->url('home'));
+    } finally {
+        spl_autoload_unregister($autoload);
+    }
 });
 
 $test('environment reads server values before defaults', static function () use ($assertSame): void {

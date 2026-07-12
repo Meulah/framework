@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Meulah;
 
+use Meulah\Container\Container;
 use Meulah\Config\Repository;
 use Meulah\Exception\ExceptionHandler;
 use Meulah\Http\CallableRequestHandler;
@@ -29,6 +30,9 @@ final class Application
     ) {
         $this->config = $config ?? new Repository();
         $this->exceptions = $exceptions ?? new ExceptionHandler(false, new ErrorLogLogger());
+        $this->container()->instance(self::class, $this);
+        $this->container()->instance(Repository::class, $this->config);
+        $this->container()->instance(ExceptionHandler::class, $this->exceptions);
     }
 
     public function router(): Router
@@ -39,6 +43,11 @@ final class Application
     public function config(): Repository
     {
         return $this->config;
+    }
+
+    public function container(): Container
+    {
+        return $this->router->container();
     }
 
     public function middleware(Middleware ...$middleware): self

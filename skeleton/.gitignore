@@ -1,6 +1,8 @@
+/.env
+/vendor/
+/database.sqlite
 /.idea/
 /.vscode/
-/vendor/
 /.phpunit.cache/
 /.phpunit.result.cache
 .DS_Store

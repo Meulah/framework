@@ -18,6 +18,11 @@ final class Application
     {
     }
 
+    public static function runFrom(string $applicationRoot, array $arguments): int
+    {
+        return (new self(ProjectRoot::explicit($applicationRoot)))->run($arguments);
+    }
+
     public function run(array $arguments): int
     {
         $command = $arguments[1] ?? 'help';

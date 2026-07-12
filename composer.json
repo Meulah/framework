@@ -1,7 +1,7 @@
 {
     "name": "meulah/framework",
     "description": "A small, explicit PHP framework for conventional server-rendered applications.",
-    "type": "project",
+    "type": "library",
     "license": "MIT",
     "require": {
         "php": ">=8.1",

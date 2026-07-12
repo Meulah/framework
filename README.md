@@ -13,7 +13,22 @@ Meulah is a small, explicit PHP framework for conventional server-rendered appli
 
 Meulah currently requires PHP 8.1 or newer.
 
+## Package boundary
+
+The repository now contains two distinct Composer packages:
+
+```text
+src/       reusable framework code (meulah/framework)
+bin/       executable installed as vendor/bin/meulah
+tests/     framework contract tests
+skeleton/  standalone application starter (meulah/starter)
+```
+
+The framework root is a library and is not itself a web application. The starter owns application concerns: the `App\` namespace, environment file, configuration, bootstrap, routes, controllers, views, migrations, public entry point, and root `meulah` launcher. This keeps framework upgrades separate from application code and gives new applications a small conventional structure without making those folders framework requirements.
+
 ## Request lifecycle
+
+Inside an application created from the starter, the request lifecycle remains visible:
 
 ```text
 public/index.php
@@ -32,9 +47,64 @@ use Meulah\Http\Response;
 $router->get('/', static fn (): Response => Response::html('<h1>Hello</h1>'), 'home');
 ```
 
+The optional final argument names a route. Generate root-relative URLs through the router rather than hard-coding application paths:
+
+```php
+$router->get('/users/{user}', [UserController::class, 'show'], 'users.show');
+
+$url = $router->url(
+    'users.show',
+    ['user' => 42],
+    ['tab' => 'profile'],
+);
+// /users/42?tab=profile
+```
+
+Path parameters are required by name and encoded as URL segments. A single parameter cannot contain `/` or `\`; model multi-segment paths as separate route parameters. The separate query array supports nested values and uses RFC 3986 encoding. Unknown route names, missing or extra path parameters, empty values, and duplicate route names fail immediately with a clear exception. Generated URLs are deliberately root-relative; applications that need an absolute URL should prepend their explicitly configured trusted origin.
+
 Unknown paths return `404 Not Found`. A known path requested with an unsupported HTTP method returns `405 Method Not Allowed` with an `Allow` header.
 
 `Meulah\Http\Response` is the default implementation of `ResponseInterface`. Routing, middleware, request handlers, and the application kernel depend on the interface, so applications may return another compatible response implementation when needed.
+
+## Dependency injection
+
+Controller class handlers are constructed through the application's dependency container. Constructor parameters typed as concrete classes are recursively autowired; interfaces require an explicit binding:
+
+```php
+use Meulah\Config\Repository;
+use Meulah\Container\Container;
+
+$container = $app->container();
+$container->bind(UserRepository::class, PdoUserRepository::class);
+$container->singleton(Cache::class, function (Container $container): Cache {
+    return new Cache($container->get(Repository::class));
+});
+$container->instance(Clock::class, $clock);
+```
+
+`bind()` creates a new instance for each resolution, `singleton()` reuses the first resolved instance, and `instance()` registers an existing object. Factories receive the container and must return an object.
+
+Controllers can then declare their dependencies normally:
+
+```php
+use Meulah\Http\Request;
+
+final class UserController
+{
+    public function __construct(private readonly UserRepository $users)
+    {
+    }
+
+    public function show(Request $request, string $user): string
+    {
+        return $this->users->find($user)->name;
+    }
+}
+
+$router->get('/users/{user}', [UserController::class, 'show']);
+```
+
+Invokable controller class strings are also supported. Meulah deliberately does not guess scalar values, choose among union types, or invent implementations for interfaces. Register those decisions explicitly; unresolved and circular dependencies produce `BindingResolutionException` with the dependency context.
 
 ## Request data
 
@@ -213,7 +283,9 @@ php meulah migrate:reset
 php meulah migrate:fresh
 ```
 
-The root `meulah` launcher delegates to the internal `bin/meulah` executable. `migrate` runs only files not recorded in the migration history table. All migrations from one invocation share a batch number, and `migrate:rollback` reverses the most recent batch in reverse filename order. `migrate:reset` rolls back every recorded batch. `migrate:fresh` drops every table—including tables not managed by migrations—and then reruns all migrations. A recorded migration whose file has been removed appears as `Missing` in the status output.
+The starter's root `meulah` launcher passes its application root directly to the single framework CLI implementation. The framework also exposes `vendor/bin/meulah`; that entry point honors `MEULAH_APPLICATION_ROOT`, searches upward from the current directory, and then checks its Composer installation relationship. Discovery accepts only projects with the starter's explicit `extra.meulah.application` marker and expected bootstrap, configuration, and route structure.
+
+`migrate` runs only files not recorded in the migration history table. All migrations from one invocation share a batch number, and `migrate:rollback` reverses the most recent batch in reverse filename order. `migrate:reset` rolls back every recorded batch. `migrate:fresh` drops every table—including tables not managed by migrations—and then reruns all migrations. A recorded migration whose file has been removed appears as `Missing` in the status output.
 
 Use `--path=some/directory` to override the configured directory. `DB_MIGRATIONS` and `DB_MIGRATION_TABLE` configure the defaults. Migration SQL remains intentionally explicit, so applications that support multiple database engines should use SQL compatible with each selected engine.
 
@@ -233,9 +305,30 @@ Production responses hide exception details. Development responses include the e
 
 ## Installation
 
-1. Copy `.env.example` to `.env` and set local credentials.
-2. Run `composer install` from the repository root.
-3. Point the web server document root at `public/`, or use the included Apache rewrite rules during local development.
+Application developers should use the starter. Once the `0.1` packages are published separately, the normal installation path is:
+
+```bash
+composer create-project meulah/starter my-app
+```
+
+The starter `0.1` line requires `meulah/framework ^0.1`; it contains no development-branch constraint or monorepo-relative repository. Publishing the framework `0.1` tag and moving `skeleton/` to the separate starter repository are release gates before advertising `create-project` as available.
+
+Custom skeleton authors and advanced integrations may install the framework directly:
+
+```bash
+composer require meulah/framework:^0.1
+```
+
+Framework contributors run `composer install` and `composer test` at this repository root. To exercise a clean application consumer before the packages are published:
+
+```bash
+php tests/create-starter.php ../meulah-test-app
+cd ../meulah-test-app
+composer install
+php meulah --help
+```
+
+The helper modifies only the disposable copy, injecting a path repository with framework version `0.1.0`. The publication-ready starter manifest remains independent of the monorepo.
 
 ## Tests
 
@@ -251,10 +344,10 @@ or:
 php tests/run.php
 ```
 
-## Direction
+The GitHub Actions workflow validates and tests the framework on PHP 8.1 and 8.5. It also builds a clean starter consumer on Linux and Windows, installs normal and `--no-dev` dependencies, renders the home route, exercises all three CLI entry paths, and runs migration discovery from a nested directory.
 
-The repository contains only the reusable framework kernel. Authentication, user models, mail delivery, UUID generation, and application views are intentionally not bundled. Applications install optional packages and define those features according to their own needs.
+## Application ownership
 
-All framework implementation now lives in the namespaced `src` tree. Application code can organize its own controllers, models, and views without those directories being requirements of the framework.
+The framework package contains only reusable kernel behavior. Authentication, user models, mail delivery, UUID generation, and application-specific views are intentionally not bundled. Applications install optional packages and define those features according to their own needs.
 
-The next milestone will provide a separate application skeleton instead of mixing sample application code into the kernel.
+All framework implementation lives in the namespaced `src` tree. The starter offers one recommended application layout, but the kernel still depends only on Composer namespaces and explicit bootstrap configuration.

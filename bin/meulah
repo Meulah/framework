@@ -4,16 +4,31 @@
 declare(strict_types=1);
 
 use Meulah\Console\Application;
+use Meulah\Console\ProjectRoot;
 
-$root = dirname(__DIR__);
-$autoload = $root . '/vendor/autoload.php';
+$packageRoot = dirname(__DIR__);
+$autoloaders = [
+    $packageRoot . '/vendor/autoload.php',
+    dirname($packageRoot, 2) . '/autoload.php',
+];
 
-if (!is_file($autoload)) {
+foreach ($autoloaders as $autoload) {
+    if (is_file($autoload)) {
+        require_once $autoload;
+        break;
+    }
+}
+
+if (!class_exists(Application::class)) {
     fwrite(STDERR, 'Composer dependencies are missing. Run composer install.' . PHP_EOL);
     exit(1);
 }
 
-require $autoload;
+try {
+    $root = ProjectRoot::discover();
+} catch (RuntimeException $exception) {
+    fwrite(STDERR, 'Error: ' . $exception->getMessage() . PHP_EOL);
+    exit(1);
+}
 
-exit((new Application($root))->run($argv));
-
+exit(Application::runFrom($root, $argv));
