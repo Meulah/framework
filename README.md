@@ -15,16 +15,15 @@ Meulah currently requires PHP 8.1 or newer.
 
 ## Package boundary
 
-The repository now contains two distinct Composer packages:
+This repository contains only the reusable framework package:
 
 ```text
 src/       reusable framework code (meulah/framework)
 bin/       executable installed as vendor/bin/meulah
 tests/     framework contract tests
-skeleton/  standalone application starter (meulah/starter)
 ```
 
-The framework root is a library and is not itself a web application. The starter owns application concerns: the `App\` namespace, environment file, configuration, bootstrap, routes, controllers, views, migrations, public entry point, and root `meulah` launcher. This keeps framework upgrades separate from application code and gives new applications a small conventional structure without making those folders framework requirements.
+The [Meulah application starter](https://github.com/Meulah/meulah) is maintained in its own repository. It owns application concerns: the `App\` namespace, environment file, configuration, bootstrap, routes, controllers, views, migrations, public entry point, and root `meulah` launcher. The framework root is a Composer library and is not itself a web application.
 
 ## Request lifecycle
 
@@ -305,13 +304,13 @@ Production responses hide exception details. Development responses include the e
 
 ## Installation
 
-Application developers should use the starter. Once the `0.1` packages are published separately, the normal installation path is:
+Application developers should use the separate [Meulah application starter](https://github.com/Meulah/meulah). Once the `0.1` packages are published, the normal installation path is:
 
 ```bash
 composer create-project meulah/starter my-app
 ```
 
-The starter `0.1` line requires `meulah/framework ^0.1`; it contains no development-branch constraint or monorepo-relative repository. Publishing the framework `0.1` tag and moving `skeleton/` to the separate starter repository are release gates before advertising `create-project` as available.
+The repository split is complete. Publishing compatible `0.1` releases for `meulah/framework` and `meulah/starter` remains the release gate before advertising `create-project` as generally available.
 
 Custom skeleton authors and advanced integrations may install the framework directly:
 
@@ -319,16 +318,7 @@ Custom skeleton authors and advanced integrations may install the framework dire
 composer require meulah/framework:^0.1
 ```
 
-Framework contributors run `composer install` and `composer test` at this repository root. To exercise a clean application consumer before the packages are published:
-
-```bash
-php tests/create-starter.php ../meulah-test-app
-cd ../meulah-test-app
-composer install
-php meulah --help
-```
-
-The helper modifies only the disposable copy, injecting a path repository with framework version `0.1.0`. The publication-ready starter manifest remains independent of the monorepo.
+Framework contributors run `composer install` and `composer test` at this repository root. Application bootstrapping, `create-project`, and clean-consumer installation are owned and tested by the starter repository.
 
 ## Tests
 
@@ -344,10 +334,10 @@ or:
 php tests/run.php
 ```
 
-The GitHub Actions workflow validates and tests the framework on PHP 8.1 and 8.5. It also builds a clean starter consumer on Linux and Windows, installs normal and `--no-dev` dependencies, renders the home route, exercises all three CLI entry paths, and runs migration discovery from a nested directory.
+The GitHub Actions workflow validates, lints, and tests the framework on PHP 8.1 and 8.5. Framework tests use a minimal marked application fixture to verify CLI root discovery without depending on the external starter repository.
 
 ## Application ownership
 
 The framework package contains only reusable kernel behavior. Authentication, user models, mail delivery, UUID generation, and application-specific views are intentionally not bundled. Applications install optional packages and define those features according to their own needs.
 
-All framework implementation lives in the namespaced `src` tree. The starter offers one recommended application layout, but the kernel still depends only on Composer namespaces and explicit bootstrap configuration.
+All framework implementation lives in the namespaced `src` tree. The external starter offers one recommended application layout, but the kernel still depends only on Composer namespaces and explicit bootstrap configuration.

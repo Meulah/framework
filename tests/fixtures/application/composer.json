@@ -1,0 +1,9 @@
+{
+    "name": "meulah/test-application",
+    "type": "project",
+    "extra": {
+        "meulah": {
+            "application": true
+        }
+    }
+}

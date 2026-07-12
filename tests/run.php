@@ -799,29 +799,29 @@ $test('configuration loads application configuration files', static function () 
 });
 
 $test('project root discovery walks up from an application subdirectory', static function () use ($assertSame): void {
-    $skeleton = realpath(dirname(__DIR__) . '/skeleton');
+    $applicationRoot = realpath(__DIR__ . '/fixtures/application');
 
-    if ($skeleton === false) {
-        throw new RuntimeException('Starter skeleton is missing.');
+    if ($applicationRoot === false) {
+        throw new RuntimeException('Application fixture is missing.');
     }
 
-    $assertSame($skeleton, ProjectRoot::discover($skeleton . '/public'));
-    $assertSame($skeleton, ProjectRoot::discover($skeleton . '/database/migrations'));
+    $assertSame($applicationRoot, ProjectRoot::discover($applicationRoot . '/public'));
+    $assertSame($applicationRoot, ProjectRoot::discover($applicationRoot . '/database/migrations'));
 });
 
 $test('project root discovery honors the explicit environment root first', static function () use ($assertSame): void {
     $key = 'MEULAH_APPLICATION_ROOT';
     $original = $_ENV[$key] ?? null;
     $existed = array_key_exists($key, $_ENV);
-    $skeleton = realpath(dirname(__DIR__) . '/skeleton');
+    $applicationRoot = realpath(__DIR__ . '/fixtures/application');
 
-    if ($skeleton === false) {
-        throw new RuntimeException('Starter skeleton is missing.');
+    if ($applicationRoot === false) {
+        throw new RuntimeException('Application fixture is missing.');
     }
 
     try {
-        $_ENV[$key] = $skeleton;
-        $assertSame($skeleton, ProjectRoot::discover(dirname(__DIR__)));
+        $_ENV[$key] = $applicationRoot;
+        $assertSame($applicationRoot, ProjectRoot::discover(dirname(__DIR__)));
     } finally {
         if ($existed) {
             $_ENV[$key] = $original;
@@ -840,41 +840,6 @@ $test('project root discovery rejects unmarked Composer projects', static functi
             true,
             str_starts_with($exception->getMessage(), 'Directory is not a marked Meulah application:'),
         );
-    }
-});
-
-$test('starter skeleton boots its controller route and view', static function () use ($assertSame): void {
-    $root = dirname(__DIR__) . '/skeleton';
-    $autoload = static function (string $className) use ($root): void {
-        $prefix = 'App\\';
-
-        if (!str_starts_with($className, $prefix)) {
-            return;
-        }
-
-        $relativeClass = substr($className, strlen($prefix));
-        $file = $root . '/app/' . str_replace('\\', '/', $relativeClass) . '.php';
-
-        if (is_file($file)) {
-            require_once $file;
-        }
-    };
-
-    spl_autoload_register($autoload);
-
-    try {
-        /** @var Application $application */
-        $application = require $root . '/bootstrap.php';
-        $router = $application->router();
-        require $root . '/routes/web.php';
-
-        $response = $application->handle(new Request('GET', '/'));
-
-        $assertSame(200, $response->status());
-        $assertSame(true, str_contains($response->content(), 'Your Meulah application is ready.'));
-        $assertSame('/', $router->url('home'));
-    } finally {
-        spl_autoload_unregister($autoload);
     }
 });
 
