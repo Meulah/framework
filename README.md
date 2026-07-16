@@ -327,7 +327,7 @@ Wildcards, route parameters, prefixes, and query-string conditions are rejected,
 
 ## Validation
 
-Validation produces separate application data and never mutates the request. `Validator` is a concrete, stateless class, so it can be constructed directly or injected through Meulah's container:
+Validation produces separate application data and never mutates the request or source array. `Validator` remains the public entry point; rule parsing and evaluation are isolated internally so malformed rule definitions fail before user data is evaluated.
 
 ```php
 use Meulah\Validation\Validator;
@@ -336,7 +336,7 @@ $result = $validator->validate(
     $request->allInput(),
     [
         'name' => ['required', 'string', 'min:2', 'max:100'],
-        'email' => ['required', 'email'],
+        'email' => ['required', 'string', 'email'],
         'age' => ['nullable', 'integer', 'min:18'],
     ],
 );
@@ -349,48 +349,116 @@ if (!$result->isValid()) {
 $data = $result->validated();
 ```
 
-`validated()` contains only fields declared in the rule set that passed all their rules. Optional missing fields and unrelated input are omitted. A present nullable field is retained as `null`.
+`validated()` contains only declared fields that passed every applicable rule. Optional missing fields, unrelated input, and invalid fields are omitted. Validation has no default-value feature: a missing value remains missing, and an invalid value is never replaced.
 
-Use `validateOrFail()` when the request should stop immediately:
+Use `validateOrFail()` when validation should stop request handling:
 
 ```php
 $data = $validator->validateOrFail(
     $request->allInput(),
-    ['email' => ['required', 'email']],
+    ['email' => ['required', 'string', 'email']],
 );
 ```
 
-Failure throws `Meulah\Validation\ValidationException`. The application exception handler renders it as HTTP `422`; JSON responses include field errors under `error.fields`.
+Failure throws `Meulah\Validation\ValidationException` with HTTP status `422`. JSON requests receive stable field errors under `error.fields`; HTML requests receive a generic response without submitted values. Error messages never include submitted values, client MIME values, or temporary upload paths.
 
-The initial rule set is intentionally small:
+### Presence and nullability
 
-- Presence: `required`, `present`, `nullable`
-- Types: `string`, `integer`, `boolean`, `array`, `email`
-- Size and value: `min`, `max`, `between`, `in`
-- Relationships: `same`, `confirmed`
-- Uploads: `file`, `max_size`, `detected_mime`
+Presence and validity are separate concepts:
 
-Rules use colon-separated parameters:
+| Input state | `required` | `present` | `nullable` |
+|---|---|---|---|
+| Field absent | fails | fails | field remains omitted |
+| `null` | fails | passes | retains `null` and skips later rules |
+| Empty string | fails | passes | not treated as null |
+| Whitespace-only string | passes | passes | unchanged |
+| `0`, `"0"`, or `false` | passes | passes | unchanged or explicitly type-normalized |
+| Empty array | fails | passes | not treated as null |
+
+`required` considers only `null`, `''`, and `[]` empty. It does not trim strings. Use `present` plus `nullable` when a key must exist but may contain `null`; `required` and `nullable` are rejected as a conflicting rule set.
+
+A missing field is not evaluated by ordinary type, size, comparison, or file rules. A present `null` value without `nullable` is evaluated normally and usually fails its type rules.
+
+### Rule parsing and execution
+
+Rules are declared as a list of strings. Rule names are case-insensitive, while parameters remain exact and are not silently trimmed or lowercased.
 
 ```php
 [
     'role' => ['in:admin,editor,viewer'],
     'password' => ['confirmed'],
-    'password_confirmation' => ['present'],
     'backup_email' => ['same:email'],
 ]
 ```
 
-`confirmed` compares a field with `{field}_confirmation`, while `same:other` compares it with another named input field. Comparisons are strict after any explicit `integer` or `boolean` normalization requested by the field rules.
+The parser rejects:
 
-For strings, `min`, `max`, and `between` measure Unicode characters; for arrays they measure item count; for integers they compare the numeric value. Canonical form strings are normalized only when an explicit type rule requests it:
-Invalid UTF-8 cannot satisfy string size rules, and numeric rule parameters that overflow the platform are rejected as rule-definition errors.
+- unknown, empty, or non-string rules;
+- associative rule arrays instead of lists;
+- duplicate rule names, including duplicates with different casing;
+- missing, extra, duplicated, overflowing, or malformed parameters;
+- surrounding whitespace in `same` field names and MIME parameters;
+- multiple incompatible type rules;
+- `required` combined with `nullable`;
+- `email` combined with a non-string type;
+- file metadata rules combined with a non-file type;
+- size rules combined with boolean or file types.
 
-- `integer` accepts integers and canonical strings such as `"18"` or `"-2"` and returns an integer.
-- `boolean` accepts booleans, `0`, `1`, `"0"`, `"1"`, `"false"`, and `"true"` and returns a boolean.
-- Values such as `"twenty"`, `"18 years"`, `"yes"`, empty strings, and arbitrary arrays are never loosely cast.
+Malformed definitions throw `Meulah\Validation\ValidationRuleException` with the field, rule name, and rule position where useful. Submitted values are never included.
 
-Uploads are intentionally not part of `allInput()`. Pass selected files explicitly:
+Fields retain declaration order in `validated()` and `errors()`. Errors for a field retain declared rule order. All applicable rules are evaluated, except:
+
+- a failed `required` rule produces one required error and stops that field;
+- a present `null` with `nullable` is accepted and stops that field;
+- a missing field is checked only for `required` and `present`.
+
+Type normalization happens before rule evaluation and does not depend on where the type rule appears in the rule list.
+
+### Integer and boolean normalization
+
+`integer` accepts native integers and canonical base-10 strings within the current PHP platform integer range:
+
+- accepted: `18`, `"18"`, `"-18"`, `"0"`, and `"-0"`;
+- rejected: `"+18"`, `"018"`, decimals, scientific notation, hexadecimal-like strings, surrounding whitespace, booleans, floats, arrays, objects, and out-of-range values.
+
+Accepted integer strings become native integers in validated data.
+
+`boolean` accepts only these exact values:
+
+- true: `true`, `1`, `"1"`, `"true"`;
+- false: `false`, `0`, `"0"`, `"false"`.
+
+Mixed case, surrounding whitespace, `yes`, `no`, `on`, `off`, floats, arrays, and objects are rejected. Accepted forms become native booleans.
+
+### Strings, email, arrays, and size
+
+`string` accepts only native PHP strings. It does not trim, lowercase, normalize Unicode, or otherwise alter the value.
+
+For strings, `min`, `max`, and `between` count Unicode code points through PCRE, so `mbstring` is not required. A combining sequence can count as multiple code points even when displayed as one grapheme. Invalid UTF-8 cannot satisfy a string size rule.
+
+`email` uses PHP's strict email filter on the original string. Leading or trailing whitespace is rejected, case is preserved, and internationalized domains are not converted to ASCII automatically.
+
+`array` accepts indexed, associative, empty, and nested PHP arrays. Objects and `Traversable` values are not converted. Array size rules count only the top-level number of elements.
+
+`min`, `max`, and `between` support:
+
+- native or explicitly normalized integers by numeric value;
+- strings by Unicode code-point count;
+- arrays by top-level item count.
+
+Native floats and unsupported value types fail size rules. Numeric rule parameters must be canonical finite decimal values.
+
+### Strict comparisons
+
+`same:other` fails when the comparison field is missing. It compares both fields with strict equality after each declared field has undergone its own explicit type normalization.
+
+`confirmed` compares a field with `{field}_confirmation`. A missing confirmation fails. The confirmation value is normalized using the subject field's integer or boolean rule before strict comparison.
+
+`in` also uses strict equality. Allowed parameters are converted only when the validated value has an accepted integer or boolean type. For example, integer `1` matches `in:1` but does not match `in:01`. Error output says only that the value is not allowed; it does not echo the configured list.
+
+### File validation
+
+Uploads are not merged into `Request::allInput()`. Add selected files explicitly:
 
 ```php
 $data = $validator->validateOrFail(
@@ -409,8 +477,13 @@ $data = $validator->validateOrFail(
 );
 ```
 
-`max_size` is an explicit platform-sized byte limit. `detected_mime` uses server-side file inspection rather than the client-supplied media type. Unknown rules and malformed parameters throw `Meulah\Validation\ValidationRuleException` immediately because they are programming errors, not user input errors.
+`file` accepts only a valid, unmoved `UploadedFile`. Missing optional files remain omitted; invalid uploads, moved files, vanished temporary files, ordinary arrays, and arrays of uploads fail.
 
+`max_size` uses an inclusive byte boundary, so a five-byte file passes `max_size:5`. Zero-byte files can pass `max_size:0`. The limit must fit the platform integer range.
+
+`detected_mime` compares exact server-detected MIME types case-insensitively. Client filenames and client MIME declarations are ignored. MIME parameters, wildcards, whitespace, and duplicate MIME values are rejected. Detection and validity failures produce safe errors without filesystem paths.
+
+The first rule catalogue remains intentionally small: `required`, `present`, `nullable`, `string`, `integer`, `boolean`, `array`, `email`, `min`, `max`, `between`, `in`, `same`, `confirmed`, `file`, `max_size`, and `detected_mime`. Database-aware rules, DTO hydration, and implicit string normalization remain outside this layer.
 ## Middleware
 
 Middleware can inspect a request, return a response immediately, or delegate to the next handler. The first registered middleware is the outermost layer:

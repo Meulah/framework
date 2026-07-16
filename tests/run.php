@@ -794,6 +794,515 @@ $test('validation exceptions render JSON field errors as HTTP 422', static funct
     );
 });
 
+$test('validation presence and nullability distinguish missing empty and falsey values', static function () use ($assertSame): void {
+    $validator = new Validator();
+    $result = $validator->validate([
+        'null_value' => null,
+        'nullable_value' => null,
+        'empty_string' => '',
+        'whitespace' => " \t\n",
+        'zero' => 0,
+        'string_zero' => '0',
+        'false_value' => false,
+        'empty_array' => [],
+        'present_null' => null,
+    ], [
+        'optional_missing' => ['string'],
+        'required_missing' => ['required'],
+        'present_missing' => ['present'],
+        'null_value' => ['string'],
+        'nullable_value' => ['nullable', 'string'],
+        'empty_string' => ['required', 'string'],
+        'whitespace' => ['required', 'string'],
+        'zero' => ['required', 'integer'],
+        'string_zero' => ['required', 'integer'],
+        'false_value' => ['required', 'boolean'],
+        'empty_array' => ['required', 'array'],
+        'present_null' => ['present', 'nullable', 'string'],
+    ]);
+
+    $assertSame(false, $result->isValid());
+    $assertSame([
+        'required_missing',
+        'present_missing',
+        'null_value',
+        'empty_string',
+        'empty_array',
+    ], array_keys($result->errors()));
+    $assertSame([
+        'nullable_value' => null,
+        'whitespace' => " \t\n",
+        'zero' => 0,
+        'string_zero' => 0,
+        'false_value' => false,
+        'present_null' => null,
+    ], $result->validated());
+    $assertSame(false, array_key_exists('optional_missing', $result->validated()));
+});
+
+$test('integer validation accepts only canonical platform integers', static function () use ($assertSame): void {
+    $outsideRange = PHP_INT_SIZE === 8 ? '9223372036854775808' : '2147483648';
+    $input = [
+        'native' => 42,
+        'positive' => '42',
+        'negative' => '-42',
+        'negative_zero' => '-0',
+        'plus' => '+42',
+        'leading_zero' => '042',
+        'negative_leading_zero' => '-042',
+        'decimal' => '42.0',
+        'scientific' => '4.2e1',
+        'whitespace' => ' 42 ',
+        'hex' => '0x2A',
+        'outside_range' => $outsideRange,
+        'true_value' => true,
+        'false_value' => false,
+        'float_value' => 42.0,
+        'array_value' => [42],
+        'object_value' => (object) ['value' => 42],
+    ];
+    $rules = array_fill_keys(array_keys($input), ['integer']);
+    $result = (new Validator())->validate($input, $rules);
+
+    $assertSame([
+        'native' => 42,
+        'positive' => 42,
+        'negative' => -42,
+        'negative_zero' => 0,
+    ], $result->validated());
+    $assertSame([
+        'plus',
+        'leading_zero',
+        'negative_leading_zero',
+        'decimal',
+        'scientific',
+        'whitespace',
+        'hex',
+        'outside_range',
+        'true_value',
+        'false_value',
+        'float_value',
+        'array_value',
+        'object_value',
+    ], array_keys($result->errors()));
+});
+
+$test('boolean validation accepts only documented exact forms', static function () use ($assertSame): void {
+    $input = [
+        'native_true' => true,
+        'native_false' => false,
+        'integer_one' => 1,
+        'integer_zero' => 0,
+        'string_true' => 'true',
+        'string_false' => 'false',
+        'string_one' => '1',
+        'string_zero' => '0',
+        'upper_true' => 'TRUE',
+        'mixed_false' => 'False',
+        'whitespace' => ' true ',
+        'yes' => 'yes',
+        'no' => 'no',
+        'on' => 'on',
+        'off' => 'off',
+        'float_one' => 1.0,
+        'array_value' => [true],
+        'object_value' => (object) ['value' => true],
+    ];
+    $rules = array_fill_keys(array_keys($input), ['boolean']);
+    $result = (new Validator())->validate($input, $rules);
+
+    $assertSame([
+        'native_true' => true,
+        'native_false' => false,
+        'integer_one' => true,
+        'integer_zero' => false,
+        'string_true' => true,
+        'string_false' => false,
+        'string_one' => true,
+        'string_zero' => false,
+    ], $result->validated());
+    $assertSame([
+        'upper_true',
+        'mixed_false',
+        'whitespace',
+        'yes',
+        'no',
+        'on',
+        'off',
+        'float_one',
+        'array_value',
+        'object_value',
+    ], array_keys($result->errors()));
+});
+
+$test('string size validation counts Unicode code points without mbstring', static function () use ($assertSame): void {
+    $accent = "\u{00E9}";
+    $emoji = "\u{1F600}";
+    $combining = "e\u{0301}";
+    $large = str_repeat('a', 100_000);
+    $result = (new Validator())->validate([
+        'accent' => $accent,
+        'emoji' => $emoji,
+        'combining' => $combining,
+        'empty' => '',
+        'large' => $large,
+        'float_value' => 2.0,
+    ], [
+        'accent' => ['string', 'between:1,1'],
+        'emoji' => ['string', 'between:1,1'],
+        'combining' => ['string', 'between:2,2'],
+        'empty' => ['string', 'min:1'],
+        'large' => ['string', 'between:100000,100000'],
+        'float_value' => ['min:1'],
+    ]);
+
+    $validated = $result->validated();
+    $assertSame($accent, $validated['accent']);
+    $assertSame($emoji, $validated['emoji']);
+    $assertSame($combining, $validated['combining']);
+    $assertSame(100_000, strlen($validated['large']));
+    $assertSame([
+        'empty',
+        'float_value',
+    ], array_keys($result->errors()));
+});
+
+$test('email validation is strict and performs no string normalization', static function () use ($assertSame): void {
+    $result = (new Validator())->validate([
+        'preserved' => 'Ada@Example.COM',
+        'malformed' => 'ada.example.com',
+        'unicode_domain' => "ada@\u{00E9}xample.com",
+        'leading_space' => ' ada@example.com',
+        'trailing_space' => 'ada@example.com ',
+        'array_value' => ['ada@example.com'],
+        'object_value' => (object) ['email' => 'ada@example.com'],
+    ], [
+        'preserved' => ['string', 'email'],
+        'malformed' => ['email'],
+        'unicode_domain' => ['email'],
+        'leading_space' => ['email'],
+        'trailing_space' => ['email'],
+        'array_value' => ['email'],
+        'object_value' => ['email'],
+    ]);
+
+    $assertSame(['preserved' => 'Ada@Example.COM'], $result->validated());
+    $assertSame([
+        'malformed',
+        'unicode_domain',
+        'leading_space',
+        'trailing_space',
+        'array_value',
+        'object_value',
+    ], array_keys($result->errors()));
+});
+
+$test('array validation accepts PHP arrays without coercing iterable objects', static function () use ($assertSame): void {
+    $uploadPath = tempnam(sys_get_temp_dir(), 'meulah-array-upload-');
+    if ($uploadPath === false) {
+        throw new RuntimeException('Unable to create array validation fixture.');
+    }
+    file_put_contents($uploadPath, 'upload');
+
+    try {
+        $upload = UploadedFile::forTesting($uploadPath, 'upload.txt', 'text/plain');
+        $result = (new Validator())->validate([
+            'indexed' => ['a', 'b'],
+            'associative' => ['role' => 'admin'],
+            'empty' => [],
+            'nested' => [['id' => 1]],
+            'object_value' => (object) ['role' => 'admin'],
+            'traversable' => new ArrayIterator(['a', 'b']),
+            'file_value' => $upload,
+            'nested_file' => [$upload],
+        ], [
+            'indexed' => ['array'],
+            'associative' => ['array'],
+            'empty' => ['array'],
+            'nested' => ['array'],
+            'object_value' => ['array'],
+            'traversable' => ['array'],
+            'file_value' => ['array'],
+            'nested_file' => ['file'],
+        ]);
+
+        $assertSame([
+            'indexed' => ['a', 'b'],
+            'associative' => ['role' => 'admin'],
+            'empty' => [],
+            'nested' => [['id' => 1]],
+        ], $result->validated());
+        $assertSame([
+            'object_value',
+            'traversable',
+            'file_value',
+            'nested_file',
+        ], array_keys($result->errors()));
+    } finally {
+        if (is_file($uploadPath)) {
+            unlink($uploadPath);
+        }
+    }
+});
+
+$test('comparison and in rules use strict normalized equality', static function () use ($assertSame): void {
+    $result = (new Validator())->validate([
+        'missing_same' => 'value',
+        'missing_confirmation' => 'value',
+        'loose_same' => '1',
+        'native_integer' => 1,
+        'loose_confirmation' => 1,
+        'loose_confirmation_confirmation' => '1',
+        'string_allowed' => '1',
+        'integer_allowed' => 1,
+        'integer_collision' => 1,
+        'boolean_allowed' => 'false',
+    ], [
+        'missing_same' => ['same:not_present'],
+        'missing_confirmation' => ['confirmed'],
+        'loose_same' => ['same:native_integer'],
+        'native_integer' => ['present'],
+        'loose_confirmation' => ['confirmed'],
+        'string_allowed' => ['in:1'],
+        'integer_allowed' => ['integer', 'in:1'],
+        'integer_collision' => ['integer', 'in:01'],
+        'boolean_allowed' => ['boolean', 'in:false,true'],
+    ]);
+
+    $assertSame([
+        'native_integer' => 1,
+        'string_allowed' => '1',
+        'integer_allowed' => 1,
+        'boolean_allowed' => false,
+    ], $result->validated());
+    $assertSame([
+        'missing_same',
+        'missing_confirmation',
+        'loose_same',
+        'loose_confirmation',
+        'integer_collision',
+    ], array_keys($result->errors()));
+    $assertSame(
+        'The integer collision field must be one of the allowed values.',
+        $result->error('integer_collision'),
+    );
+});
+
+$test('validation rule parsing rejects duplicates conflicts and malformed parameters', static function () use ($assertSame): void {
+    $validator = new Validator();
+    $invalid = [
+        ['field' => ['required', 'REQUIRED']],
+        ['field' => ['integer', 'boolean']],
+        ['field' => ['required', 'nullable']],
+        ['field' => ['array', 'email']],
+        ['field' => ['boolean', 'min:1']],
+        ['field' => ['string', 'max_size:10']],
+        ['field' => ['same: other']],
+        ['field' => ['in:a,a']],
+        ['field' => ['detected_mime:text/plain; charset=utf-8']],
+        ['field' => ['detected_mime:text/plain,TEXT/PLAIN']],
+        ['field' => ['min']],
+        ['field' => ['between:1']],
+        ['field' => ['required:yes']],
+        ['field' => [123]],
+        ['field' => [1 => 'required']],
+        ['field' => []],
+        ['field' => ['unknown']],
+    ];
+
+    foreach ($invalid as $rules) {
+        try {
+            $validator->validate([], $rules);
+            throw new RuntimeException('Expected invalid validation rule set rejection.');
+        } catch (ValidationRuleException $exception) {
+            $assertSame(false, str_contains($exception->getMessage(), 'secret-value'));
+        }
+    }
+
+    $valid = $validator->validate(['name' => 'Ada'], ['name' => ['ReQuIrEd', 'StRiNg']]);
+    $assertSame(true, $valid->isValid());
+    $assertSame(['name' => 'Ada'], $valid->validated());
+});
+
+$test('validation errors preserve field and rule order with explicit short circuits', static function () use ($assertSame): void {
+    $result = (new Validator())->validate([
+        'second_field' => 'x',
+        'first_field' => new stdClass(),
+        'required_bail' => '',
+        'nullable_bail' => null,
+        'normalized_order' => '12',
+    ], [
+        'second_field' => ['in:allowed', 'min:2', 'email'],
+        'first_field' => ['email', 'min:1', 'in:allowed'],
+        'required_bail' => ['required', 'string', 'min:5'],
+        'nullable_bail' => ['nullable', 'string', 'min:5'],
+        'normalized_order' => ['min:10', 'integer'],
+    ]);
+
+    $assertSame([
+        'second_field',
+        'first_field',
+        'required_bail',
+    ], array_keys($result->errors()));
+    $assertSame([
+        'The second field field must be one of the allowed values.',
+        'The second field field must have a value or size of at least 2.',
+        'The second field field must be a valid email address.',
+    ], $result->errors()['second_field']);
+    $assertSame([
+        'The first field field must be a valid email address.',
+        'The first field field must have a value or size of at least 1.',
+        'The first field field must be one of the allowed values.',
+    ], $result->errors()['first_field']);
+    $assertSame(['The required bail field is required.'], $result->errors()['required_bail']);
+    $assertSame([
+        'nullable_bail' => null,
+        'normalized_order' => 12,
+    ], $result->validated());
+});
+
+$test('file validation handles lifecycle MIME and exact size boundaries safely', static function () use ($assertSame): void {
+    $textPath = tempnam(sys_get_temp_dir(), 'meulah-file-text-');
+    $zeroPath = tempnam(sys_get_temp_dir(), 'meulah-file-zero-');
+    $movedSource = tempnam(sys_get_temp_dir(), 'meulah-file-moved-');
+    $missingPath = tempnam(sys_get_temp_dir(), 'meulah-file-missing-');
+
+    if ($textPath === false || $zeroPath === false || $movedSource === false || $missingPath === false) {
+        throw new RuntimeException('Unable to create file validation fixtures.');
+    }
+
+    $movedDestination = $movedSource . '-destination';
+    file_put_contents($textPath, 'hello');
+    file_put_contents($zeroPath, '');
+    file_put_contents($movedSource, 'moved');
+    file_put_contents($missingPath, 'missing');
+
+    try {
+        $text = UploadedFile::forTesting($textPath, 'photo.jpg', 'image/jpeg');
+        $zero = UploadedFile::forTesting($zeroPath, 'empty.txt', 'text/plain');
+        $moved = UploadedFile::forTesting($movedSource, 'moved.txt', 'text/plain');
+        $moved->moveTo($movedDestination);
+        $vanished = UploadedFile::forTesting($missingPath, 'missing.txt', 'text/plain');
+        unlink($missingPath);
+        $invalid = UploadedFile::fromPhpUpload(
+            'invalid.txt',
+            'text/plain',
+            '',
+            UPLOAD_ERR_NO_FILE,
+            0,
+        );
+
+        $result = (new Validator())->validate([
+            'spoofed_mime' => $text,
+            'exact_size' => $text,
+            'too_small_limit' => $text,
+            'zero_byte' => $zero,
+            'moved' => $moved,
+            'invalid_upload' => $invalid,
+            'vanished' => $vanished,
+            'nested' => [$text],
+        ], [
+            'optional_missing' => ['file'],
+            'required_missing' => ['required', 'file'],
+            'spoofed_mime' => ['file', 'detected_mime:text/plain'],
+            'exact_size' => ['file', 'max_size:5'],
+            'too_small_limit' => ['file', 'max_size:4'],
+            'zero_byte' => ['file', 'max_size:0'],
+            'moved' => ['file'],
+            'invalid_upload' => ['file'],
+            'vanished' => ['file', 'detected_mime:text/plain'],
+            'nested' => ['file'],
+        ]);
+
+        $assertSame([
+            'spoofed_mime' => $text,
+            'exact_size' => $text,
+            'zero_byte' => $zero,
+        ], $result->validated());
+        $assertSame([
+            'required_missing',
+            'too_small_limit',
+            'moved',
+            'invalid_upload',
+            'vanished',
+            'nested',
+        ], array_keys($result->errors()));
+        $messages = implode(' ', array_merge(...array_values($result->errors())));
+        $assertSame(false, str_contains($messages, $textPath));
+        $assertSame(false, str_contains($messages, $missingPath));
+        $assertSame(false, str_contains($messages, 'image/jpeg'));
+    } finally {
+        foreach ([$textPath, $zeroPath, $movedSource, $movedDestination, $missingPath] as $path) {
+            if (is_file($path)) {
+                unlink($path);
+            }
+        }
+    }
+});
+
+$test('validation never mutates source data or exposes invalid and sensitive values', static function () use ($assertSame): void {
+    $object = (object) ['value' => 'unchanged'];
+    $source = [
+        'secret' => 'super-secret-value',
+        'integer' => '12',
+        'nested' => ['value' => 'original'],
+        'object' => $object,
+    ];
+    $snapshot = serialize($source);
+    $result = (new Validator())->validate($source, [
+        'secret' => ['in:allowed'],
+        'integer' => ['integer'],
+        'nested' => ['array'],
+        'object' => ['string'],
+    ]);
+
+    $assertSame($snapshot, serialize($source));
+    $assertSame($object, $source['object']);
+    $assertSame([
+        'integer' => 12,
+        'nested' => ['value' => 'original'],
+    ], $result->validated());
+    $messages = implode(' ', array_merge(...array_values($result->errors())));
+    $assertSame(false, str_contains($messages, 'super-secret-value'));
+    $assertSame(false, array_key_exists('secret', $result->validated()));
+    $assertSame(false, array_key_exists('object', $result->validated()));
+});
+
+$test('validation failures render safe generic HTML and structured JSON', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->post('/validation-safety', static function (Request $request): string {
+        (new Validator())->validateOrFail(
+            $request->allInput(),
+            ['password' => ['in:allowed']],
+        );
+
+        return 'ok';
+    });
+    $application = new Application($router);
+    $html = $application->handle(new Request(
+        'POST',
+        '/validation-safety',
+        body: ['password' => 'super-secret-value'],
+    ));
+    $json = $application->handle(new Request(
+        'POST',
+        '/validation-safety',
+        body: ['password' => 'super-secret-value'],
+        headers: ['Accept' => 'application/json'],
+    ));
+    $payload = json_decode($json->content(), true, 512, JSON_THROW_ON_ERROR);
+
+    $assertSame(422, $html->status());
+    $assertSame(true, str_contains($html->content(), 'The supplied data is invalid.'));
+    $assertSame(false, str_contains($html->content(), 'super-secret-value'));
+    $assertSame(422, $json->status());
+    $assertSame('validation_failed', $payload['error']['code']);
+    $assertSame(
+        'The password field must be one of the allowed values.',
+        $payload['error']['fields']['password'][0],
+    );
+    $assertSame(false, str_contains($json->content(), 'super-secret-value'));
+});
 $test('request body size limits fail before parsing', static function () use ($assertSame): void {
     try {
         new Request('POST', '/', rawBody: '12345', maxBodySize: 4);
