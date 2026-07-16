@@ -49,9 +49,20 @@ final class Csrf
 
     public function isValid(mixed $token): bool
     {
-        return is_string($token)
-            && $token !== ''
-            && hash_equals($this->token(), $token);
+        if (!is_string($token) || $token === '') {
+            return false;
+        }
+
+        $fingerprint = $this->sessionFingerprint();
+        $storedToken = $this->session->get(self::TOKEN_KEY);
+        $storedFingerprint = $this->session->get(self::SESSION_KEY);
+
+        return is_string($storedToken)
+            && strlen($storedToken) === 64
+            && preg_match('/^[a-f0-9]{64}$/D', $storedToken) === 1
+            && is_string($storedFingerprint)
+            && hash_equals($storedFingerprint, $fingerprint)
+            && hash_equals($storedToken, $token);
     }
 
     public function field(): string

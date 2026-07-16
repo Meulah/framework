@@ -28,7 +28,7 @@ final class Output
             return;
         }
 
-        fwrite($this->stdout ?? STDOUT, $message);
+        $this->writeTo($this->stdout ?? STDOUT, $message, 'standard output');
     }
 
     public function writeln(string $message = ''): void
@@ -43,7 +43,7 @@ final class Output
             return;
         }
 
-        fwrite($this->stderr ?? STDERR, $message);
+        $this->writeTo($this->stderr ?? STDERR, $message, 'error output');
     }
 
     public function errorln(string $message = ''): void
@@ -59,5 +59,29 @@ final class Output
     public function errorOutput(): string
     {
         return $this->capturedErrorOutput;
+    }
+
+    private function writeTo(mixed $stream, string $message, string $destination): void
+    {
+        $length = strlen($message);
+        $offset = 0;
+
+        while ($offset < $length) {
+            try {
+                $written = @fwrite($stream, substr($message, $offset));
+            } catch (\TypeError $exception) {
+                throw new OutputException(
+                    "Unable to write to console {$destination}; the configured stream is invalid.",
+                    0,
+                    $exception,
+                );
+            }
+
+            if ($written === false || $written === 0) {
+                throw new OutputException("Unable to write to console {$destination}.");
+            }
+
+            $offset += $written;
+        }
     }
 }

@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace Meulah\Event;
 
+use Closure;
 use InvalidArgumentException;
 use Meulah\Container\Container;
 use ReflectionClass;
+use ReflectionFunction;
 
 final class SynchronousEventDispatcher implements EventDispatcher
 {
@@ -38,7 +40,11 @@ final class SynchronousEventDispatcher implements EventDispatcher
             if (class_exists($listener)) {
                 $reflection = new ReflectionClass($listener);
 
-                if (!$reflection->isInstantiable() || !$reflection->hasMethod('__invoke')) {
+                if (
+                    !$reflection->isInstantiable()
+                    || !$reflection->hasMethod('__invoke')
+                    || !$reflection->getMethod('__invoke')->isPublic()
+                ) {
                     throw new InvalidArgumentException(sprintf(
                         "Event listener class '%s' must be instantiable and invokable.",
                         $listener,
@@ -53,6 +59,7 @@ final class SynchronousEventDispatcher implements EventDispatcher
                 ));
             }
         }
+        $this->assertListenerSignature($listener);
 
         $this->listeners[$event][] = $listener;
     }
@@ -66,6 +73,20 @@ final class SynchronousEventDispatcher implements EventDispatcher
         }
 
         return $event;
+    }
+
+    private function assertListenerSignature(callable|string $listener): void
+    {
+        $reflection = is_string($listener) && class_exists($listener)
+            ? (new ReflectionClass($listener))->getMethod('__invoke')
+            : new ReflectionFunction(Closure::fromCallable($listener));
+
+        if ($reflection->getNumberOfRequiredParameters() > 1) {
+            throw new InvalidArgumentException(sprintf(
+                "Event listener '%s' may require at most one argument.",
+                is_string($listener) ? $listener : $reflection->getName(),
+            ));
+        }
     }
 
     private function resolve(callable|string $listener): callable

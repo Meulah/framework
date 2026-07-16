@@ -36,10 +36,24 @@ final class MigrationContext
 
     public function migrationPath(Input $input): string
     {
-        $path = (string) ($input->option('path') ?? $this->kernel()->config()->string('database.migrations'));
+        if ($input->hasOption('path')) {
+            $path = $input->option('path');
+
+            if (!is_string($path) || trim($path) === '') {
+                throw new ConsoleInputException("Option '--path' requires a non-empty directory value.");
+            }
+        } else {
+            $path = $this->kernel()->config()->string('database.migrations');
+        }
 
         if (preg_match('#^(?:[A-Za-z]:[\\\\/]|/|\\\\\\\\)#', $path) === 1) {
-            return rtrim($path, '/\\');
+            if (preg_match('#^[A-Za-z]:[\\\\/]$#', $path) === 1) {
+                return $path;
+            }
+
+            $trimmed = rtrim($path, '/\\');
+
+            return $trimmed === '' ? '/' : $trimmed;
         }
 
         return $this->root . DIRECTORY_SEPARATOR . trim($path, '/\\');

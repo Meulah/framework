@@ -9,9 +9,11 @@ use Meulah\Config\Repository;
 use Meulah\Console\Application as ConsoleEntrypoint;
 use Meulah\Console\Command;
 use Meulah\Console\CommandRegistry;
+use Meulah\Console\ConsoleInputException;
 use Meulah\Console\ConsoleApplication;
 use Meulah\Console\Input as ConsoleInput;
 use Meulah\Console\Output as ConsoleOutput;
+use Meulah\Console\OutputException;
 use Meulah\Console\ProjectRoot;
 use Meulah\Database\Connection;
 use Meulah\Database\Migration;
@@ -29,6 +31,7 @@ use Meulah\Http\InvalidInput;
 use Meulah\Http\Middleware;
 use Meulah\Http\RequestHandler;
 use Meulah\Http\Response;
+use Meulah\Http\ResponseException;
 use Meulah\Http\ResponseInterface;
 use Meulah\Http\SameSite;
 use Meulah\Http\UploadedFile;
@@ -36,15 +39,19 @@ use Meulah\Http\UploadException;
 use Meulah\Log\Logger;
 use Meulah\Routing\MethodNotAllowed;
 use Meulah\Routing\RouteNotFound;
+use Meulah\Routing\RouteDefinitionException;
 use Meulah\Routing\RouteHandlerException;
 use Meulah\Routing\Router;
 use Meulah\Routing\UrlGenerationException;
 use Meulah\Security\Csrf\Csrf;
+use Meulah\Security\Csrf\CsrfConfigurationException;
 use Meulah\Security\Csrf\VerifyCsrfToken;
 use Meulah\Session\NativeSession;
 use Meulah\Session\Session;
+use Meulah\Session\SessionException;
 use Meulah\Support\Environment;
 use Meulah\Validation\ValidationException;
+use Meulah\Validation\ValidationRuleException;
 use Meulah\Validation\Validator;
 use Meulah\View\View;
 use Tests\Fixtures\CircularOne;
@@ -162,6 +169,15 @@ $test('native sessions store regenerate invalidate and age flash data', static f
         $session->put('nullable', null);
         $assertSame(42, $session->get('user_id'));
         $assertSame(null, $session->get('nullable', 'fallback'));
+        $duplicate = new NativeSession(name: 'MEULAHTESTSESSION', secure: false);
+
+        try {
+            $duplicate->get('user_id');
+            throw new RuntimeException('Expected duplicate native session ownership rejection.');
+        } catch (SessionException $exception) {
+            $assertSame(true, str_contains($exception->getMessage(), 'already managed'));
+        }
+
 
         $csrf = new Csrf($session);
         $oldToken = $csrf->token();
@@ -211,6 +227,14 @@ $test('native sessions store regenerate invalidate and age flash data', static f
             rmdir($directory);
         }
     }
+});
+
+$test('CSRF validation does not create session state for missing tokens', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $csrf = new Csrf($session);
+
+    $assertSame(false, $csrf->isValid(str_repeat('a', 64)));
+    $assertSame([], $session->data);
 });
 
 $test('CSRF tokens are random stable and bound to the session identifier', static function () use ($assertSame, $sessionFactory): void {
@@ -307,11 +331,11 @@ $test('CSRF middleware protects unsafe methods and accepts form or header tokens
 });
 
 $test('CSRF exclusions reject route patterns and query strings', static function () use ($sessionFactory): void {
-    foreach (['webhooks/provider', '/webhooks/*', '/users/{user}', '/callback?trusted=yes'] as $exclusion) {
+    foreach (['webhooks/provider', '/webhooks/*', '/users/{user}', '/callback?trusted=yes', '/callback%3Ftrusted=yes', '/callback%23fragment', '/webhooks/%2A'] as $exclusion) {
         try {
             new VerifyCsrfToken($sessionFactory(), [$exclusion]);
             throw new RuntimeException('Expected non-explicit CSRF exclusion rejection.');
-        } catch (InvalidArgumentException) {
+        } catch (CsrfConfigurationException) {
         }
     }
 });
@@ -395,6 +419,54 @@ $test('captured requests hide the internal rewrite parameter', static function (
     } finally {
         $_GET = $originalGet;
         $_POST = $originalPost;
+        $_SERVER = $originalServer;
+    }
+});
+
+$test('requests reject invalid methods paths and rewrite values', static function () use ($assertSame): void {
+    foreach ([
+        ["GET\r\nX-Injected", '/', 'invalid_http_method'],
+        ['GET', '/safe%0Dpath', 'invalid_request_path'],
+    ] as [$method, $path, $errorCode]) {
+        try {
+            new Request($method, $path);
+            throw new RuntimeException('Expected invalid request metadata rejection.');
+        } catch (BadRequest $exception) {
+            $assertSame($errorCode, $exception->errorCode());
+        }
+    }
+
+    $originalGet = $_GET;
+    $originalServer = $_SERVER;
+
+    try {
+        $_GET = ['url' => ['not-a-path']];
+        $_SERVER['REQUEST_METHOD'] = 'GET';
+
+        try {
+            Request::capture();
+            throw new RuntimeException('Expected non-string rewrite path rejection.');
+        } catch (BadRequest $exception) {
+            $assertSame('invalid_request_path', $exception->errorCode());
+        }
+
+        $_GET = [];
+        foreach ([
+            [['REQUEST_METHOD' => 'GET', 'REQUEST_URI' => [], 'SCRIPT_NAME' => '/index.php'], 'invalid_request_path'],
+            [['REQUEST_METHOD' => 'GET', 'REQUEST_URI' => '/', 'SCRIPT_NAME' => []], 'invalid_request_path'],
+            [['REQUEST_METHOD' => 'GET', 'REQUEST_URI' => '/', 'SCRIPT_NAME' => '/index.php', 'CONTENT_LENGTH' => 'ten'], 'invalid_content_length'],
+        ] as [$server, $errorCode]) {
+            $_SERVER = $server;
+
+            try {
+                Request::capture();
+                throw new RuntimeException('Expected invalid captured request metadata rejection.');
+            } catch (BadRequest $exception) {
+                $assertSame($errorCode, $exception->errorCode());
+            }
+        }
+    } finally {
+        $_GET = $originalGet;
         $_SERVER = $originalServer;
     }
 });
@@ -558,6 +630,27 @@ $test('validation returns normalized application data without mutating its sourc
     $assertSame('not validated', $input['ignored']);
 });
 
+$test('validation compares typed confirmations and same fields consistently', static function () use ($assertSame): void {
+    $result = (new Validator())->validate([
+        'pin' => '42',
+        'pin_confirmation' => '42',
+        'pin_copy' => '42',
+        'enabled' => 'false',
+        'enabled_confirmation' => 'false',
+    ], [
+        'pin' => ['integer', 'confirmed', 'same:pin_copy'],
+        'pin_copy' => ['integer'],
+        'enabled' => ['boolean', 'confirmed'],
+    ]);
+
+    $assertSame(true, $result->isValid());
+    $assertSame([
+        'pin' => 42,
+        'pin_copy' => 42,
+        'enabled' => false,
+    ], $result->validated());
+});
+
 $test('validation reports strict rule failures without loose coercion', static function () use ($assertSame): void {
     $result = (new Validator())->validate([
         'name' => '',
@@ -622,6 +715,8 @@ $test('validation rejects unknown malformed and empty rule definitions', static 
         ['email' => ['sometimes']],
         ['name' => ['between:10,2']],
         ['avatar' => ['max_size:2mb']],
+        ['avatar' => ['max_size:' . str_repeat('9', 100)]],
+        ['name' => ['min:' . str_repeat('9', 400)]],
         ['name' => []],
     ];
 
@@ -629,9 +724,13 @@ $test('validation rejects unknown malformed and empty rule definitions', static 
         try {
             $validator->validate([], $rules);
             throw new RuntimeException('Expected invalid validation rule rejection.');
-        } catch (InvalidArgumentException) {
+        } catch (ValidationRuleException) {
         }
     }
+
+    $invalidUtf8 = $validator->validate(['name' => "\xC3\x28"], ['name' => ['string', 'min:1']]);
+    $assertSame(false, $invalidUtf8->isValid());
+    $assertSame('The name field must have a value or size of at least 1.', $invalidUtf8->error('name'));
 
     $assertSame(true, (new Container())->get(Validator::class) instanceof Validator);
 });
@@ -1005,6 +1104,7 @@ $test('event registration rejects unknown events and invalid class listeners', s
         ['Missing\\Event', static fn (): mixed => null],
         [UserRegistered::class, stdClass::class],
         [UserRegistered::class, 'Missing\\Listener'],
+        [UserRegistered::class, static fn (UserRegistered $event, string $extra): mixed => null],
     ] as [$event, $listener]) {
         try {
             $events->listen($event, $listener);
@@ -1163,7 +1263,7 @@ $test('route constraints reject unknown parameters and invalid patterns', static
     try {
         $route->where('account', '\\d+');
         throw new RuntimeException('Expected unknown constraint parameter rejection.');
-    } catch (InvalidArgumentException $exception) {
+    } catch (RouteDefinitionException $exception) {
         $assertSame(
             "Route path '/users/{user}' does not contain a parameter named 'account'.",
             $exception->getMessage(),
@@ -1173,11 +1273,39 @@ $test('route constraints reject unknown parameters and invalid patterns', static
     try {
         $route->where('user', '[');
         throw new RuntimeException('Expected invalid constraint pattern rejection.');
-    } catch (InvalidArgumentException $exception) {
+    } catch (RouteDefinitionException $exception) {
         $assertSame(
             "The constraint for route parameter 'user' is not a valid regular expression.",
             $exception->getMessage(),
         );
+    }
+
+    try {
+        $route->where('user', '(?P<user>\d+)');
+        throw new RuntimeException('Expected named constraint capture rejection.');
+    } catch (RouteDefinitionException $exception) {
+        $assertSame(
+            "The constraint for route parameter 'user' cannot contain a named capture.",
+            $exception->getMessage(),
+        );
+    }
+
+    try {
+        (new Router())->match(
+            ["GET\r\nX-Injected"],
+            '/unsafe',
+            static fn (): string => 'unsafe',
+        );
+        throw new RuntimeException('Expected invalid route method rejection.');
+    } catch (RouteDefinitionException) {
+    }
+
+    foreach (["/unsafe\r\n", '/unsafe?query=yes', '/unsafe#fragment'] as $path) {
+        try {
+            (new Router())->get($path, static fn (): string => 'unsafe');
+            throw new RuntimeException('Expected invalid route path rejection.');
+        } catch (RouteDefinitionException) {
+        }
     }
 });
 
@@ -1545,6 +1673,8 @@ $test('cookies reject unsafe names values attributes and expiration', static fun
             value: 'dark',
             expires: new DateTimeImmutable('1500-01-01 00:00:00+00:00'),
         ),
+        static fn (): Cookie => Cookie::make(name: '__Secure-id', value: 'value', secure: false),
+        static fn (): Cookie => Cookie::make(name: '__Host-id', value: 'value', path: '/app', secure: true),
     ];
 
     foreach ($invalidCookies as $createCookie) {
@@ -1596,6 +1726,18 @@ $test('responses reject invalid status codes and headers early', static function
     } catch (InvalidArgumentException) {
     }
 });
+$test('response sending fails explicitly after output has started', static function (): void {
+    if (!headers_sent()) {
+        return;
+    }
+
+    try {
+        Response::html('late')->send();
+        throw new RuntimeException('Expected late response send rejection.');
+    } catch (ResponseException) {
+    }
+});
+
 
 $test('response header replacement is case insensitive', static function () use ($assertSame): void {
     $response = (new Response('', 200, ['X-Trace' => 'first']))
@@ -1701,9 +1843,24 @@ $test('console input preserves arguments and explicit option values', static fun
     try {
         ConsoleInput::fromTokens('demo', ['--=invalid']);
         throw new RuntimeException('Expected empty option name rejection.');
-    } catch (InvalidArgumentException $exception) {
+    } catch (ConsoleInputException $exception) {
         $assertSame('An option name cannot be empty.', $exception->getMessage());
     }
+
+    try {
+        ConsoleInput::fromTokens('demo', ['--force', '--force=false']);
+        throw new RuntimeException('Expected duplicate option rejection.');
+    } catch (ConsoleInputException $exception) {
+        $assertSame("Option '--force' cannot be provided more than once.", $exception->getMessage());
+    }
+});
+
+$test('migration path overrides preserve Unix and Windows filesystem roots', static function () use ($assertSame): void {
+    $context = new \Meulah\Console\MigrationContext(__DIR__ . '/fixtures/application');
+    $windowsRoot = 'C:\\';
+
+    $assertSame('/', $context->migrationPath(ConsoleInput::fromTokens('migrate', ['--path=/'])));
+    $assertSame($windowsRoot, $context->migrationPath(ConsoleInput::fromTokens('migrate', ['--path=' . $windowsRoot])));
 });
 
 $test('command registry resolves aliases rejects collisions and sorts commands', static function () use ($assertSame): void {
@@ -1799,6 +1956,25 @@ $test('console output separates and captures stdout and stderr without ANSI', st
 
     fclose($stdout);
     fclose($stderr);
+
+    $readOnlyPath = tempnam(sys_get_temp_dir(), 'meulah-output-');
+    if ($readOnlyPath === false) {
+        throw new RuntimeException('Unable to create read-only output fixture.');
+    }
+    $readOnly = fopen($readOnlyPath, 'r');
+    if ($readOnly === false) {
+        unlink($readOnlyPath);
+        throw new RuntimeException('Unable to open read-only output fixture.');
+    }
+    try {
+        (new ConsoleOutput(false, $readOnly, $readOnly))->write('cannot-write');
+        throw new RuntimeException('Expected console output failure.');
+    } catch (OutputException) {
+    } finally {
+        fclose($readOnly);
+        unlink($readOnlyPath);
+    }
+
 });
 
 $test('console list order and command failures have stable output and exits', static function () use ($assertSame): void {
@@ -1950,6 +2126,65 @@ $test('console executes registered command aliases with parsed input', static fu
 
     $assertSame(7, $console->run(['meulah', 'hello', 'Ada', '--style=warm']));
     $assertSame('hello:Ada:warm' . PHP_EOL, $output->output());
+});
+
+$test('make migration never overwrites an existing timestamped file', static function () use ($assertSame): void {
+    $directory = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'meulah_collision_' . bin2hex(random_bytes(6));
+    if (!mkdir($directory, 0775, true) && !is_dir($directory)) {
+        throw new RuntimeException('Unable to create migration collision fixture.');
+    }
+
+    $files = [];
+    try {
+        for ($offset = 0; $offset <= 5; $offset++) {
+            $file = $directory . DIRECTORY_SEPARATOR
+                . gmdate('Y_m_d_His', time() + $offset)
+                . '_collision.php';
+            file_put_contents($file, 'existing');
+            $files[] = $file;
+        }
+
+        $command = new \Meulah\Console\Commands\MakeMigrationCommand(
+            new \Meulah\Console\MigrationContext(__DIR__ . '/fixtures/application'),
+        );
+
+        try {
+            $command->execute(
+                ConsoleInput::fromTokens('make:migration', ['collision', '--path=' . $directory]),
+                ConsoleOutput::buffered(),
+            );
+            throw new RuntimeException('Expected migration collision rejection.');
+        } catch (RuntimeException $exception) {
+            $assertSame(true, str_starts_with($exception->getMessage(), 'Migration already exists:'));
+        }
+
+        foreach ($files as $file) {
+            $assertSame('existing', file_get_contents($file));
+        }
+    } finally {
+        foreach (glob($directory . DIRECTORY_SEPARATOR . '*') ?: [] as $file) {
+            if (is_file($file)) {
+                unlink($file);
+            }
+        }
+        if (is_dir($directory)) {
+            rmdir($directory);
+        }
+    }
+});
+$test('migration commands reject missing and empty path option values', static function () use ($assertSame): void {
+    if (!in_array('sqlite', \PDO::getAvailableDrivers(), true)) {
+        return;
+    }
+
+    foreach (['--path', '--path='] as $pathOption) {
+        $output = ConsoleOutput::buffered();
+        $console = new ConsoleEntrypoint(__DIR__ . '/fixtures/application', $output);
+        $status = $console->run(['meulah', 'migrate:status', $pathOption]);
+        $assertSame(1, $status);
+        $assertSame('', $output->output());
+        $assertSame("Error: Option '--path' requires a non-empty directory value." . PHP_EOL, $output->errorOutput());
+    }
 });
 
 $test('migration status runs through its command object', static function () use ($assertSame): void {

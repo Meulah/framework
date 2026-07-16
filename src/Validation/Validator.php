@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Meulah\Validation;
 
-use InvalidArgumentException;
 use Meulah\Http\UploadedFile;
 use Meulah\Http\UploadException;
 
@@ -62,6 +61,8 @@ final class Validator
                     $rule['name'],
                     $rule['parameters'],
                     $normalized,
+                    $data,
+                    $fieldRules,
                 );
 
                 if ($error !== null) {
@@ -103,18 +104,18 @@ final class Validator
 
         foreach ($rules as $field => $definitions) {
             if (!is_string($field) || trim($field) === '') {
-                throw new InvalidArgumentException('Validation rule fields must be non-empty strings.');
+                throw new ValidationRuleException('Validation rule fields must be non-empty strings.');
             }
 
             if (!is_array($definitions)) {
-                throw new InvalidArgumentException(sprintf(
+                throw new ValidationRuleException(sprintf(
                     "Validation rules for field '%s' must be an array.",
                     $field,
                 ));
             }
 
             if ($definitions === []) {
-                throw new InvalidArgumentException(sprintf(
+                throw new ValidationRuleException(sprintf(
                     "Validation rules for field '%s' cannot be empty.",
                     $field,
                 ));
@@ -122,7 +123,7 @@ final class Validator
 
             foreach ($definitions as $definition) {
                 if (!is_string($definition) || trim($definition) === '') {
-                    throw new InvalidArgumentException(sprintf(
+                    throw new ValidationRuleException(sprintf(
                         "Validation rules for field '%s' must be non-empty strings.",
                         $field,
                     ));
@@ -133,7 +134,7 @@ final class Validator
                 $parameters = $parameterList === null ? [] : explode(',', $parameterList);
 
                 if (!in_array($name, self::RULES, true)) {
-                    throw new InvalidArgumentException(sprintf(
+                    throw new ValidationRuleException(sprintf(
                         "Unknown validation rule '%s' for field '%s'.",
                         $name,
                         $field,
@@ -191,8 +192,13 @@ final class Validator
             if (
                 count($parameters) !== 1
                 || preg_match('/^(?:0|[1-9][0-9]*)$/', $parameters[0]) !== 1
+                || filter_var(
+                    $parameters[0],
+                    FILTER_VALIDATE_INT,
+                    ['options' => ['min_range' => 0]],
+                ) === false
             ) {
-                $this->invalidRule($field, $rule, 'expects one non-negative byte count');
+                $this->invalidRule($field, $rule, 'expects one platform-sized non-negative byte count');
             }
         }
 
@@ -203,7 +209,7 @@ final class Validator
 
     private function invalidRule(string $field, string $rule, string $expectation): never
     {
-        throw new InvalidArgumentException(sprintf(
+        throw new ValidationRuleException(sprintf(
             "Validation rule '%s' for field '%s' %s.",
             $rule,
             $field,
@@ -225,28 +231,32 @@ final class Validator
                 continue;
             }
 
-            $value = $data[$field];
-
-            if ($this->hasRule($rules, 'integer')) {
-                [$valid, $integer] = $this->parseInteger($value);
-
-                if ($valid) {
-                    $value = $integer;
-                }
-            }
-
-            if ($this->hasRule($rules, 'boolean')) {
-                [$valid, $boolean] = $this->parseBoolean($value);
-
-                if ($valid) {
-                    $value = $boolean;
-                }
-            }
-
-            $normalized[$field] = $value;
+            $normalized[$field] = $this->normalizeValue($data[$field], $rules);
         }
 
         return $normalized;
+    }
+
+    /** @param list<array{name: string, parameters: list<string>}> $rules */
+    private function normalizeValue(mixed $value, array $rules): mixed
+    {
+        if ($this->hasRule($rules, 'integer')) {
+            [$valid, $integer] = $this->parseInteger($value);
+
+            if ($valid) {
+                return $integer;
+            }
+        }
+
+        if ($this->hasRule($rules, 'boolean')) {
+            [$valid, $boolean] = $this->parseBoolean($value);
+
+            if ($valid) {
+                return $boolean;
+            }
+        }
+
+        return $value;
     }
 
     /** @param list<array{name: string, parameters: list<string>}> $rules */
@@ -263,14 +273,18 @@ final class Validator
 
     /**
      * @param list<string> $parameters
-     * @param array<string, mixed> $data
+     * @param array<string, mixed> $normalized
+     * @param array<string, mixed> $source
+     * @param list<array{name: string, parameters: list<string>}> $fieldRules
      */
     private function validateRule(
         string $field,
         mixed $value,
         string $rule,
         array $parameters,
-        array $data,
+        array $normalized,
+        array $source,
+        array $fieldRules,
     ): ?string {
         return match ($rule) {
             'required', 'present', 'nullable' => null,
@@ -293,11 +307,15 @@ final class Validator
             'max' => $this->validateMaximum($field, $value, $parameters[0]),
             'between' => $this->validateBetween($field, $value, $parameters[0], $parameters[1]),
             'in' => $this->validateIn($field, $value, $parameters),
-            'same' => array_key_exists($parameters[0], $data) && $value === $data[$parameters[0]]
+            'same' => array_key_exists($parameters[0], $source)
+                && $value === $normalized[$parameters[0]]
                 ? null
                 : $this->message($field, "must match {$parameters[0]}."),
-            'confirmed' => array_key_exists($field . '_confirmation', $data)
-                && $value === $data[$field . '_confirmation']
+            'confirmed' => array_key_exists($field . '_confirmation', $source)
+                && $value === $this->normalizeValue(
+                    $source[$field . '_confirmation'],
+                    $fieldRules,
+                )
                     ? null
                     : $this->message($field, 'confirmation does not match.'),
             'file' => $value instanceof UploadedFile && $value->isValid()
@@ -396,7 +414,7 @@ final class Validator
 
         if (is_string($value)) {
             $length = preg_match_all('/./us', $value);
-            return $length === false ? strlen($value) : $length;
+            return $length === false ? null : $length;
         }
 
         return is_array($value) ? count($value) : null;
@@ -437,7 +455,11 @@ final class Validator
 
     private function isNumber(string $value): bool
     {
-        return preg_match('/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/', $value) === 1;
+        if (preg_match('/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/', $value) !== 1) {
+            return false;
+        }
+
+        return is_finite((float) $value);
     }
 
     private function message(string $field, string $message): string

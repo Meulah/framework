@@ -9,6 +9,8 @@ use stdClass;
 
 final class Request
 {
+    private const METHOD_PATTERN = "/^[!#\\$%&'*+.^_`|~0-9A-Za-z-]+$/D";
+
     private bool $jsonDecoded = false;
     private mixed $decodedJson = null;
     private readonly string $originalMethod;
@@ -35,8 +37,14 @@ final class Request
             throw new BadRequest('Request body is too large.', 'payload_too_large', status: 413);
         }
 
+        $method = strtoupper($method);
+
+        if (preg_match(self::METHOD_PATTERN, $method) !== 1) {
+            throw new BadRequest('The request method is invalid.', 'invalid_http_method');
+        }
+
         $this->headers = self::normalizeHeaders($headers);
-        $this->originalMethod = strtoupper($method);
+        $this->originalMethod = $method;
         $this->method = $this->resolveMethod($this->originalMethod);
         $this->path = self::normalizePath($path);
     }
@@ -46,16 +54,42 @@ final class Request
 
     public static function capture(int $maxBodySize = 10_485_760): self
     {
-        $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+        $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+        if (!is_string($method)) {
+            throw new BadRequest('The request method is invalid.', 'invalid_http_method');
+        }
+
         $query = $_GET;
 
-        if (isset($_GET['url'])) {
-            $path = '/' . trim((string) $_GET['url'], '/');
+        if (array_key_exists('url', $_GET)) {
+            if (!is_string($_GET['url'])) {
+                throw new BadRequest('The rewritten request path must be a string.', 'invalid_request_path');
+            }
+
+            $path = '/' . trim($_GET['url'], '/');
             unset($query['url']);
         } else {
-            $path = (string) (parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/');
-            $basePath = str_replace('\\', '/', dirname((string) ($_SERVER['SCRIPT_NAME'] ?? '/index.php')));
+            $requestUri = $_SERVER['REQUEST_URI'] ?? '/';
+            $scriptName = $_SERVER['SCRIPT_NAME'] ?? '/index.php';
 
+            if (!is_string($requestUri) || !is_string($scriptName)) {
+                throw new BadRequest('The request path metadata is invalid.', 'invalid_request_path');
+            }
+
+            $parsedUri = parse_url($requestUri);
+
+            if ($parsedUri === false) {
+                throw new BadRequest('The request URI is invalid.', 'invalid_request_path');
+            }
+
+            $parsedPath = $parsedUri['path'] ?? null;
+            if ($parsedPath !== null && !is_string($parsedPath)) {
+                throw new BadRequest('The request URI path is invalid.', 'invalid_request_path');
+            }
+
+            $path = $parsedPath !== null && $parsedPath !== '' ? $parsedPath : '/';
+            $basePath = str_replace('\\', '/', dirname($scriptName));
             if (
                 $basePath !== '/'
                 && $basePath !== '.'
@@ -65,13 +99,17 @@ final class Request
             }
         }
 
-        $contentLength = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+        $contentLength = self::contentLength($_SERVER['CONTENT_LENGTH'] ?? 0);
 
         if ($contentLength > $maxBodySize) {
             throw new BadRequest('Request body is too large.', 'payload_too_large', status: 413);
         }
 
         $rawBody = file_get_contents('php://input', false, null, 0, $maxBodySize + 1);
+
+        if ($rawBody === false) {
+            throw new BadRequest('Unable to read the request body.', 'request_body_unavailable');
+        }
 
         return new self(
             $method,
@@ -82,7 +120,7 @@ final class Request
             self::headersFromServer($_SERVER),
             $_COOKIE,
             self::normalizeFiles($_FILES),
-            $rawBody === false ? '' : $rawBody,
+            $rawBody,
             $maxBodySize,
         );
     }
@@ -405,9 +443,36 @@ final class Request
             || preg_match('#application/[a-z0-9.+-]+\+json#', $accept) === 1;
     }
 
+    private static function contentLength(mixed $value): int
+    {
+        if (is_int($value) && $value >= 0) {
+            return $value;
+        }
+
+        if (
+            is_string($value)
+            && preg_match('/^(?:0|[1-9][0-9]*)$/', $value) === 1
+            && ($length = filter_var(
+                $value,
+                FILTER_VALIDATE_INT,
+                ['options' => ['min_range' => 0]],
+            )) !== false
+        ) {
+            return $length;
+        }
+
+        throw new BadRequest('The Content-Length header is invalid.', 'invalid_content_length');
+    }
+
     private static function normalizePath(string $path): string
     {
-        $path = '/' . trim(rawurldecode($path), '/');
+        $decoded = rawurldecode($path);
+
+        if (preg_match('/[\x00-\x1F\x7F]/', $decoded) === 1) {
+            throw new BadRequest('The request path contains invalid control characters.', 'invalid_request_path');
+        }
+
+        $path = '/' . trim($decoded, '/');
 
         return $path === '/' ? '/' : rtrim($path, '/');
     }

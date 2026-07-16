@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Meulah\Routing;
 
-use InvalidArgumentException;
 use Meulah\Http\Middleware;
 
 final class Route
@@ -32,7 +31,7 @@ final class Route
     public function where(string $parameter, string $pattern): self
     {
         if (!in_array($parameter, $this->parameterNames(), true)) {
-            throw new InvalidArgumentException(sprintf(
+            throw new RouteDefinitionException(sprintf(
                 "Route path '%s' does not contain a parameter named '%s'.",
                 $this->path,
                 $parameter,
@@ -40,13 +39,20 @@ final class Route
         }
 
         if ($pattern === '') {
-            throw new InvalidArgumentException('A route parameter constraint cannot be empty.');
+            throw new RouteDefinitionException('A route parameter constraint cannot be empty.');
+        }
+
+        if (preg_match("/\\(\\?(?:P?<|<[A-Za-z_]|'[A-Za-z_])/", $pattern) === 1) {
+            throw new RouteDefinitionException(sprintf(
+                "The constraint for route parameter '%s' cannot contain a named capture.",
+                $parameter,
+            ));
         }
 
         $escapedPattern = str_replace('#', '\\#', $pattern);
 
         if (@preg_match('#^(?:' . $escapedPattern . ')$#', '') === false) {
-            throw new InvalidArgumentException(sprintf(
+            throw new RouteDefinitionException(sprintf(
                 "The constraint for route parameter '%s' is not a valid regular expression.",
                 $parameter,
             ));

@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace Meulah\Console;
 
-use InvalidArgumentException;
-
 final class Input
 {
     /**
@@ -36,14 +34,18 @@ final class Input
                 $option = substr($token, 2);
 
                 if ($option === '') {
-                    throw new InvalidArgumentException('An option name cannot be empty.');
+                    throw new ConsoleInputException('An option name cannot be empty.');
                 }
 
                 [$name, $value] = array_pad(explode('=', $option, 2), 2, true);
 
                 if ($name === '') {
-                    throw new InvalidArgumentException('An option name cannot be empty.');
+                    throw new ConsoleInputException('An option name cannot be empty.');
                 }
+                if (array_key_exists($name, $options)) {
+                    throw new ConsoleInputException("Option '--{$name}' cannot be provided more than once.");
+                }
+
                 $options[$name] = $value;
                 continue;
             }

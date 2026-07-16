@@ -6,10 +6,13 @@ namespace Meulah\Session;
 
 use InvalidArgumentException;
 use Meulah\Http\SameSite;
+use WeakReference;
 
 final class NativeSession implements Session
 {
     private const FLASH_KEY = '__meulah_flash';
+
+    private static ?WeakReference $activeOwner = null;
 
     private bool $started = false;
     private bool $flashAged = false;
@@ -62,7 +65,18 @@ final class NativeSession implements Session
                 ));
             }
 
+            $owner = self::$activeOwner?->get();
+
+            if ($owner instanceof self && $owner !== $this) {
+                throw new SessionException(sprintf(
+                    "Native session '%s' is already managed by another NativeSession instance.",
+                    $this->name,
+                ));
+            }
+
+            $this->assertActiveConfiguration();
             $this->started = true;
+            self::$activeOwner = WeakReference::create($this);
             $this->ageFlashData();
             return;
         }
@@ -75,6 +89,7 @@ final class NativeSession implements Session
             throw new SessionException("Unable to set native session name '{$this->name}'.");
         }
 
+        error_clear_last();
         $started = @session_start([
             'use_strict_mode' => 1,
             'use_only_cookies' => 1,
@@ -87,10 +102,11 @@ final class NativeSession implements Session
         ]);
 
         if (!$started || session_status() !== PHP_SESSION_ACTIVE) {
-            throw new SessionException('Unable to start the native PHP session.');
+            throw $this->nativeFailure('Unable to start the native PHP session.');
         }
 
         $this->started = true;
+        self::$activeOwner = WeakReference::create($this);
         $this->ageFlashData();
     }
 
@@ -122,8 +138,9 @@ final class NativeSession implements Session
     {
         $this->start();
 
+        error_clear_last();
         if (!@session_regenerate_id(true)) {
-            throw new SessionException('Unable to regenerate the native session identifier.');
+            throw $this->nativeFailure('Unable to regenerate the native session identifier.');
         }
     }
 
@@ -132,8 +149,9 @@ final class NativeSession implements Session
         $this->start();
         $_SESSION = [];
 
+        error_clear_last();
         if (!@session_regenerate_id(true)) {
-            throw new SessionException('Unable to invalidate the native session.');
+            throw $this->nativeFailure('Unable to invalidate the native session.');
         }
     }
 
@@ -169,8 +187,46 @@ final class NativeSession implements Session
             session_write_close();
         }
 
+        $owner = self::$activeOwner?->get();
+        if ($owner === $this) {
+            self::$activeOwner = null;
+        }
+
         $this->started = false;
         $this->flashAged = false;
+    }
+
+    private function assertActiveConfiguration(): void
+    {
+        $parameters = session_get_cookie_params();
+        $sameSite = (string) ($parameters['samesite'] ?? '');
+
+        if (
+            (int) $parameters['lifetime'] === $this->lifetime
+            && (string) $parameters['path'] === $this->path
+            && (bool) $parameters['secure'] === $this->secure
+            && (bool) $parameters['httponly'] === $this->httpOnly
+            && strcasecmp($sameSite, $this->sameSite->value) === 0
+        ) {
+            return;
+        }
+
+        throw new SessionException(sprintf(
+            "Active native session '%s' has different cookie configuration.",
+            $this->name,
+        ));
+    }
+
+    private function nativeFailure(string $message): SessionException
+    {
+        $error = error_get_last();
+        $detail = is_array($error) && is_string($error['message'] ?? null)
+            ? trim($error['message'])
+            : '';
+
+        return new SessionException($detail === ''
+            ? $message
+            : $message . ' Native PHP reported: ' . $detail);
     }
 
     private function assertKey(string $key): void

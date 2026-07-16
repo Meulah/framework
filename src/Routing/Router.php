@@ -19,6 +19,8 @@ use UnexpectedValueException;
 
 final class Router
 {
+    private const METHOD_PATTERN = "/^[!#\\$%&'*+.^_`|~0-9A-Za-z-]+$/D";
+
     /** @var list<Route> */
     private array $routes = [];
 
@@ -231,14 +233,32 @@ final class Router
 
     private function add(array $methods, string $path, callable|array|string $handler, ?string $name): Route
     {
-        $methods = array_values(array_unique(array_map('strtoupper', $methods)));
+        $normalizedMethods = [];
+
+        foreach ($methods as $method) {
+            if (!is_string($method) || preg_match(self::METHOD_PATTERN, $method) !== 1) {
+                throw new RouteDefinitionException('Route methods must be non-empty valid HTTP tokens.');
+            }
+
+            $normalizedMethods[] = strtoupper($method);
+        }
+
+        $methods = array_values(array_unique($normalizedMethods));
 
         if ($methods === []) {
-            throw new InvalidArgumentException('A route needs at least one HTTP method.');
+            throw new RouteDefinitionException('A route needs at least one HTTP method.');
         }
 
         $group = $this->currentGroup();
         $path = $this->joinPaths($group['prefix'], $path);
+
+        if (
+            preg_match('/[\x00-\x1F\x7F]/', $path) === 1
+            || str_contains($path, '?')
+            || str_contains($path, '#')
+        ) {
+            throw new RouteDefinitionException('Route paths cannot contain controls, queries, or fragments.');
+        }
         $name = $name === null ? null : trim($name);
 
         if ($name === '') {

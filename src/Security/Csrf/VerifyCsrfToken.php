@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Meulah\Security\Csrf;
 
-use InvalidArgumentException;
 use Meulah\Http\Middleware;
 use Meulah\Http\Request;
 use Meulah\Http\RequestHandler;
@@ -22,7 +21,7 @@ final class VerifyCsrfToken implements Middleware
     public function __construct(Session $session, array $except = [])
     {
         $this->csrf = new Csrf($session);
-        $this->except = array_map($this->normalizeExclusion(...), $except);
+        $this->except = array_values(array_unique(array_map($this->normalizeExclusion(...), $except)));
     }
 
     public function process(Request $request, RequestHandler $next): ResponseInterface
@@ -64,17 +63,28 @@ final class VerifyCsrfToken implements Middleware
             !is_string($path)
             || $path === ''
             || !str_starts_with($path, '/')
-            || preg_match('/[\x00-\x1F\x7F]/', $path) === 1
+        ) {
+            throw new CsrfConfigurationException(
+                'CSRF exclusions must be explicit route paths without patterns or query strings.',
+            );
+        }
+
+        $path = rawurldecode($path);
+
+        if (
+            preg_match('/[\x00-\x1F\x7F]/', $path) === 1
             || str_contains($path, '*')
             || str_contains($path, '{')
             || str_contains($path, '}')
             || str_contains($path, '?')
             || str_contains($path, '#')
         ) {
-            throw new InvalidArgumentException('CSRF exclusions must be explicit route paths without patterns or query strings.');
+            throw new CsrfConfigurationException(
+                'CSRF exclusions must be explicit route paths without patterns or query strings.',
+            );
         }
 
-        $path = '/' . trim(rawurldecode($path), '/');
+        $path = '/' . trim($path, '/');
 
         return $path === '/' ? '/' : rtrim($path, '/');
     }

@@ -113,6 +113,10 @@ final class Response implements ResponseInterface
 
     public function send(): void
     {
+        if (headers_sent($file, $line)) {
+            throw new ResponseException("Cannot send a response after output was sent at {$file}:{$line}.");
+        }
+
         http_response_code($this->status);
 
         foreach ($this->headers as $name => $value) {

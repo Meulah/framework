@@ -51,6 +51,14 @@ final class Cookie
             throw new InvalidArgumentException('SameSite=None cookies must be Secure.');
         }
 
+        if (str_starts_with($name, '__Secure-') && !$secure) {
+            throw new InvalidArgumentException('__Secure- cookies must be Secure.');
+        }
+
+        if (str_starts_with($name, '__Host-') && (!$secure || $path !== '/')) {
+            throw new InvalidArgumentException('__Host- cookies must be Secure and use Path=/.');
+        }
+
         if ($expires !== null) {
             $year = (int) $expires->format('Y');
 

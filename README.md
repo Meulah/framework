@@ -47,6 +47,7 @@ $router->get('/', static fn (): Response => Response::html('<h1>Hello</h1>'), 'h
 ```
 
 The router provides `get()`, `post()`, `put()`, `patch()`, `delete()`, and `options()` for ordinary HTTP routes. Use `match()` when one handler intentionally accepts a specific set of methods.
+Route methods must be valid HTTP token strings; empty values, control characters, and header-like method text are rejected when routes are registered. Route paths cannot contain control characters, query strings, or fragments.
 
 Related routes can share a path prefix, name prefix, and middleware. Groups may be nested; parent attributes are applied before child attributes:
 
@@ -73,6 +74,7 @@ $router
 ```
 
 Constraints only select routes and pass the matched string to the handler. Meulah does not perform implicit route-model binding.
+Constraint fragments may use ordinary capture groups, but named captures are rejected because they can collide with Meulah's internal route-parameter captures.
 
 The optional final argument names a route. Generate root-relative URLs through the router rather than hard-coding application paths:
 
@@ -157,6 +159,7 @@ For server-rendered forms, a POST request may explicitly represent `PUT`, `PATCH
 ```
 
 The `X-HTTP-Method-Override` header is also supported for clients that cannot send those methods directly. Overrides are considered only when the original method is `POST`, and only `PUT`, `PATCH`, or `DELETE` are accepted. Query-string overrides are ignored; unsupported, non-string, or conflicting form/header values produce a `400` response. The effective method is resolved while constructing the request, before routing. Use `originalMethod()` when application code needs to distinguish the transport method from `method()`.
+Original request methods must also be valid HTTP tokens. Invalid method text, non-string server path metadata, malformed `Content-Length` values, and control characters in decoded request paths produce a `400` response before routing.
 
 Request data remains explicit:
 
@@ -198,6 +201,7 @@ $request->array('roles');
 Defaults apply only when input is missing. A supplied value of the wrong type produces an `invalid_input` 400 error instead of silently coercing to `0`, `false`, or an empty value. Request data has no merge or replace methods: it continues to represent the original client request, while validation and normalization should produce separate application data.
 
 The raw request body is read once, cached on the request, and shared by `rawBody()` and `json()`. `HTTP_MAX_BODY_SIZE` defaults to 10 MiB and limits how much data Meulah reads into memory; web-server body limits should also remain enabled.
+A request-body read failure is reported as `request_body_unavailable`; it is never silently treated as an empty body.
 
 Nested PHP uploads are normalized into `UploadedFile` objects while preserving their original keys. An uploaded file exposes `clientFilename()`, `clientMediaType()`, server-inspected `detectedMediaType()`, `temporaryPath()`, `error()`, and `size()`. Client filenames and client media types are untrusted input. Applications should generate storage names and validate detected type and file contents independently.
 
@@ -239,7 +243,7 @@ $cookie = Cookie::make(
 return Response::html('Saved')->withCookie($cookie);
 ```
 
-`withCookie()` returns a new response. Multiple calls retain multiple cookies and `send()` emits each one as a separate `Set-Cookie` header. Cookie values are percent-encoded during serialization. Invalid names, CR/LF injection, unsafe paths, unsupported SameSite values, `SameSite=None` without `Secure`, and expiration years outside 1601 through 9999 are rejected before a response can be sent.
+`withCookie()` returns a new response. Multiple calls retain multiple cookies and `send()` emits each one as a separate `Set-Cookie` header. Cookie values are percent-encoded during serialization. Invalid names, CR/LF injection, unsafe paths, unsupported SameSite values, `SameSite=None` without `Secure`, invalid `__Secure-` or `__Host-` prefix attributes, and expiration years outside 1601 through 9999 are rejected before a response can be sent. `send()` also fails explicitly if PHP has already committed response headers.
 
 Sessions remain an explicit application choice. Bind the contract to the native PHP driver in application bootstrap when session state is needed:
 
@@ -259,6 +263,7 @@ $container->singleton(
 ```
 
 `NativeSession` starts lazily on the first session operation; reading a request cookie never starts it. It enables PHP strict session IDs, cookie-only transport, disabled URL ID propagation, HttpOnly cookies, and SameSite protection. Its default cookie is Secure; local plain-HTTP development must opt out explicitly with `secure: false`.
+Bind `NativeSession` as a request-scoped singleton. Two wrapper instances are not allowed to manage the same active native session because doing so could age flash data twice; an adopted active session must also have the same configured cookie attributes.
 
 ```php
 $user = $session->get('user');
@@ -269,7 +274,7 @@ $session->invalidate();
 $session->flash('notice', 'Profile saved.');
 ```
 
-`regenerate()` rotates the identifier while preserving data. `invalidate()` clears all session data and rotates the identifier. Flash data is available during the request that creates it and the following request, then is removed when the next request starts. Session operations must happen before response output is sent.
+`regenerate()` rotates the identifier while preserving data. `invalidate()` clears all session data and rotates the identifier. Flash data is available during the request that creates it and the following request, then is removed when the next request starts. Session operations must happen before response output is sent. Long-running workers must call `close()` at the end of each request and must not retain the session wrapper across requests.
 
 Only the native PHP driver exists in this milestone. Its persistence is controlled by PHP's configured session save handler. File, database, and Redis drivers remain future adapters behind the same `Session` contract.
 
@@ -298,6 +303,7 @@ Render the hidden field inside every state-changing server-rendered form:
 ~~~
 
 The generated token contains 256 bits of cryptographic randomness, is stored in the session, and is compared with hash_equals(). It is bound to the current session identifier. After regenerate() or invalidate() rotates that identifier, the next CSRF access creates a new token and the previous token no longer validates.
+`isValid()` is read-only: checking an absent or stale token does not create CSRF session state. Call `token()` or `field()` when an application intentionally needs a token.
 
 VerifyCsrfToken requires a valid token for every method except GET, HEAD, and OPTIONS. Method spoofing happens first, so forms representing PUT, PATCH, or DELETE are protected as unsafe requests.
 
@@ -317,7 +323,7 @@ new VerifyCsrfToken($session, except: [
 ]);
 ~~~
 
-Wildcards, route parameters, prefixes, and query-string conditions are rejected. Each excluded endpoint must therefore be an explicit security decision.
+Wildcards, route parameters, prefixes, and query-string conditions are rejected, including percent-encoded forms of those characters. Exclusions are decoded before validation. Each excluded endpoint must therefore be an explicit security decision.
 
 ## Validation
 
@@ -375,9 +381,10 @@ Rules use colon-separated parameters:
 ]
 ```
 
-`confirmed` compares a field with `{field}_confirmation`, while `same:other` compares it with another named input field. Comparisons are strict.
+`confirmed` compares a field with `{field}_confirmation`, while `same:other` compares it with another named input field. Comparisons are strict after any explicit `integer` or `boolean` normalization requested by the field rules.
 
 For strings, `min`, `max`, and `between` measure Unicode characters; for arrays they measure item count; for integers they compare the numeric value. Canonical form strings are normalized only when an explicit type rule requests it:
+Invalid UTF-8 cannot satisfy string size rules, and numeric rule parameters that overflow the platform are rejected as rule-definition errors.
 
 - `integer` accepts integers and canonical strings such as `"18"` or `"-2"` and returns an integer.
 - `boolean` accepts booleans, `0`, `1`, `"0"`, `"1"`, `"false"`, and `"true"` and returns a boolean.
@@ -402,7 +409,7 @@ $data = $validator->validateOrFail(
 );
 ```
 
-`max_size` is an explicit byte limit. `detected_mime` uses server-side file inspection rather than the client-supplied media type. Unknown rules and malformed parameters throw `InvalidArgumentException` immediately because they are programming errors, not user input errors.
+`max_size` is an explicit platform-sized byte limit. `detected_mime` uses server-side file inspection rather than the client-supplied media type. Unknown rules and malformed parameters throw `Meulah\Validation\ValidationRuleException` immediately because they are programming errors, not user input errors.
 
 ## Middleware
 
@@ -480,7 +487,7 @@ final class SendWelcomeEmail
 }
 ~~~
 
-Dispatch is synchronous and listeners run in registration order. Listener return values are ignored, dispatch() returns the same event object, and an exception immediately stops dispatch and propagates to the caller.
+Dispatch is synchronous and listeners run in registration order. A listener may require at most the event argument; incompatible listener signatures are rejected during registration. Listener return values are ignored, `dispatch()` returns the same event object, and an exception immediately stops dispatch and propagates to the caller.
 
 Matching is intentionally exact: listeners registered for another class or parent type are not discovered. This version has no queues, event discovery, wildcard listeners, subscribers, realtime broadcasting, annotations, or attributes.
 
@@ -555,7 +562,7 @@ php meulah migrate:fresh
 
 The starter's root `meulah` launcher passes its application root directly to the single framework CLI implementation. The framework also exposes `vendor/bin/meulah`; that entry point honors `MEULAH_APPLICATION_ROOT`, searches upward from the current directory, and then checks its Composer installation relationship. Discovery accepts only projects with the starter's explicit `extra.meulah.application` marker and expected bootstrap, configuration, and route structure.
 
-Console features are individual objects implementing `Meulah\Console\Command`. `ConsoleApplication` owns only registration and dispatch, while the launcher composes the built-in migration commands for an application root. `Input` exposes positional arguments and long options and `Output` separates ordinary and error output. Applications can add custom commands without modifying the dispatcher:
+Console features are individual objects implementing `Meulah\Console\Command`. `ConsoleApplication` owns only registration and dispatch, while the launcher composes the built-in migration commands for an application root. `Input` exposes positional arguments and long options, rejects duplicate option names, and does not coerce option values. `Output` separates ordinary and error output and reports stream write failures explicitly. Applications can add custom commands without modifying the dispatcher:
 
 ```php
 use Meulah\Console\Application;
@@ -570,7 +577,7 @@ An unknown command returns a non-zero status and suggests close registered names
 
 `migrate` runs only files not recorded in the migration history table. All migrations from one invocation share a batch number, and `migrate:rollback` reverses the most recent batch in reverse filename order. `migrate:reset` rolls back every recorded batch. `migrate:fresh` drops every table—including tables not managed by migrations—and then reruns all migrations. A recorded migration whose file has been removed appears as `Missing` in the status output.
 
-Use `--path=some/directory` to override the configured directory. `DB_MIGRATIONS` and `DB_MIGRATION_TABLE` configure the defaults. Migration SQL remains intentionally explicit, so applications that support multiple database engines should use SQL compatible with each selected engine.
+Use `--path=some/directory` to override the configured directory; bare `--path` and `--path=` are invalid, while Unix `/` and Windows drive roots are preserved exactly. `DB_MIGRATIONS` and `DB_MIGRATION_TABLE` configure the defaults. Migration SQL remains intentionally explicit, so applications that support multiple database engines should use SQL compatible with each selected engine.
 
 Rollback, reset, and fresh commands require `--force` when `APP_ENV=production`:
 
