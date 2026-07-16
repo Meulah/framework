@@ -9,10 +9,15 @@ use JsonException;
 
 final class Response implements ResponseInterface
 {
+    /**
+     * @param array<string, string> $headers
+     * @param list<Cookie> $cookies
+     */
     public function __construct(
         private readonly string $content = '',
         private readonly int $status = 200,
         private readonly array $headers = [],
+        private readonly array $cookies = [],
     ) {
         if ($this->status < 100 || $this->status > 599) {
             throw new InvalidArgumentException("Invalid HTTP status code: {$this->status}");
@@ -25,6 +30,12 @@ final class Response implements ResponseInterface
 
             if (!is_string($value) || str_contains($value, "\r") || str_contains($value, "\n")) {
                 throw new InvalidArgumentException("Invalid value for HTTP header: {$name}");
+            }
+        }
+
+        foreach ($this->cookies as $cookie) {
+            if (!$cookie instanceof Cookie) {
+                throw new InvalidArgumentException('Response cookies must be Cookie instances.');
             }
         }
     }
@@ -64,9 +75,15 @@ final class Response implements ResponseInterface
         return $this->headers;
     }
 
+    /** @return list<Cookie> */
+    public function cookies(): array
+    {
+        return $this->cookies;
+    }
+
     public function withoutBody(): self
     {
-        return new self('', $this->status, $this->headers);
+        return new self('', $this->status, $this->headers, $this->cookies);
     }
 
     public function withHeader(string $name, string $value): self
@@ -81,7 +98,17 @@ final class Response implements ResponseInterface
 
         $headers[$name] = $value;
 
-        return new self($this->content, $this->status, $headers);
+        return new self($this->content, $this->status, $headers, $this->cookies);
+    }
+
+    public function withCookie(Cookie $cookie): self
+    {
+        return new self(
+            $this->content,
+            $this->status,
+            $this->headers,
+            [...$this->cookies, $cookie],
+        );
     }
 
     public function send(): void
@@ -90,6 +117,10 @@ final class Response implements ResponseInterface
 
         foreach ($this->headers as $name => $value) {
             header($name . ': ' . $value);
+        }
+
+        foreach ($this->cookies as $cookie) {
+            header('Set-Cookie: ' . $cookie->toHeader(), false);
         }
 
         echo $this->content;

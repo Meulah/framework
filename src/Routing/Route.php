@@ -4,12 +4,16 @@ declare(strict_types=1);
 
 namespace Meulah\Routing;
 
+use InvalidArgumentException;
 use Meulah\Http\Middleware;
 
 final class Route
 {
     /** @var list<Middleware> */
     private array $middleware = [];
+
+    /** @var array<string, string> */
+    private array $constraints = [];
 
     public function __construct(
         public readonly array $methods,
@@ -25,9 +29,50 @@ final class Route
         return $this;
     }
 
+    public function where(string $parameter, string $pattern): self
+    {
+        if (!in_array($parameter, $this->parameterNames(), true)) {
+            throw new InvalidArgumentException(sprintf(
+                "Route path '%s' does not contain a parameter named '%s'.",
+                $this->path,
+                $parameter,
+            ));
+        }
+
+        if ($pattern === '') {
+            throw new InvalidArgumentException('A route parameter constraint cannot be empty.');
+        }
+
+        $escapedPattern = str_replace('#', '\\#', $pattern);
+
+        if (@preg_match('#^(?:' . $escapedPattern . ')$#', '') === false) {
+            throw new InvalidArgumentException(sprintf(
+                "The constraint for route parameter '%s' is not a valid regular expression.",
+                $parameter,
+            ));
+        }
+
+        $this->constraints[$parameter] = $pattern;
+        return $this;
+    }
+
     /** @return list<Middleware> */
     public function middlewareStack(): array
     {
         return $this->middleware;
+    }
+
+    /** @return array<string, string> */
+    public function constraints(): array
+    {
+        return $this->constraints;
+    }
+
+    /** @return list<string> */
+    private function parameterNames(): array
+    {
+        preg_match_all('/\{([A-Za-z_][A-Za-z0-9_]*)\}/', $this->path, $matches);
+
+        return $matches[1];
     }
 }

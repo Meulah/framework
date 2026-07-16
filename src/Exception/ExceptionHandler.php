@@ -10,6 +10,8 @@ use Meulah\Http\Request;
 use Meulah\Log\Logger;
 use Meulah\Routing\MethodNotAllowed;
 use Meulah\Routing\RouteNotFound;
+use Meulah\Security\Csrf\CsrfTokenMismatch;
+use Meulah\Validation\ValidationException;
 use Throwable;
 
 final class ExceptionHandler
@@ -22,12 +24,27 @@ final class ExceptionHandler
 
     public function render(Throwable $exception, ?Request $request = null): Response
     {
+        if ($exception instanceof CsrfTokenMismatch) {
+            if ($request?->expectsJson()) {
+                return Response::json(['error' => [
+                    'code' => 'csrf_token_mismatch',
+                    'message' => $exception->getMessage(),
+                ]], 419);
+            }
+
+            return Response::html('<h1>419</h1><p>Page expired.</p>', 419);
+        }
+
         if ($exception instanceof BadRequest) {
             if ($request?->expectsJson()) {
                 $error = [
                     'code' => $exception->errorCode(),
                     'message' => $exception->getMessage(),
                 ];
+
+                if ($exception instanceof ValidationException) {
+                    $error['fields'] = $exception->errors();
+                }
 
                 if ($this->debug && $exception->detail() !== null) {
                     $error['detail'] = $exception->detail();
@@ -36,7 +53,11 @@ final class ExceptionHandler
                 return Response::json(['error' => $error], $exception->status());
             }
 
-            $title = $exception->status() === 413 ? 'Payload too large.' : 'Bad request.';
+            $title = match ($exception->status()) {
+                413 => 'Payload too large.',
+                422 => 'The supplied data is invalid.',
+                default => 'Bad request.',
+            };
             return Response::html(
                 "<h1>{$exception->status()}</h1><p>{$title}</p>",
                 $exception->status(),

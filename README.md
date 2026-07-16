@@ -46,6 +46,34 @@ use Meulah\Http\Response;
 $router->get('/', static fn (): Response => Response::html('<h1>Hello</h1>'), 'home');
 ```
 
+The router provides `get()`, `post()`, `put()`, `patch()`, `delete()`, and `options()` for ordinary HTTP routes. Use `match()` when one handler intentionally accepts a specific set of methods.
+
+Related routes can share a path prefix, name prefix, and middleware. Groups may be nested; parent attributes are applied before child attributes:
+
+```php
+$router->group([
+    'prefix' => '/admin',
+    'name' => 'admin.',
+    'middleware' => [$auth, $admin],
+], function (Router $router): void {
+    $router->get('/users', [UserController::class, 'index'], 'users.index');
+});
+
+// Path: /admin/users
+// Name: admin.users.index
+// Middleware: auth, then admin
+```
+
+Constrain dynamic path segments with regular-expression fragments. A constraint mismatch behaves like any other non-matching route:
+
+```php
+$router
+    ->get('/users/{user}', [UserController::class, 'show'], 'users.show')
+    ->where('user', '\d+');
+```
+
+Constraints only select routes and pass the matched string to the handler. Meulah does not perform implicit route-model binding.
+
 The optional final argument names a route. Generate root-relative URLs through the router rather than hard-coding application paths:
 
 ```php
@@ -120,6 +148,16 @@ $router->post('/users/{user}', function (Request $request, string $user): string
 });
 ```
 
+For server-rendered forms, a POST request may explicitly represent `PUT`, `PATCH`, or `DELETE` through a hidden `_method` field:
+
+```html
+<form method="POST" action="/users/42">
+    <input type="hidden" name="_method" value="PATCH">
+</form>
+```
+
+The `X-HTTP-Method-Override` header is also supported for clients that cannot send those methods directly. Overrides are considered only when the original method is `POST`, and only `PUT`, `PATCH`, or `DELETE` are accepted. Query-string overrides are ignored; unsupported, non-string, or conflicting form/header values produce a `400` response. The effective method is resolved while constructing the request, before routing. Use `originalMethod()` when application code needs to distinguish the transport method from `method()`.
+
 Request data remains explicit:
 
 ```php
@@ -180,6 +218,192 @@ For requests that expect JSON, malformed bodies and other request errors use a s
 
 Parser detail is omitted in production and included only when development debugging is enabled.
 
+## Response cookies and sessions
+
+Create response cookies through the immutable `Cookie` value object:
+
+```php
+use Meulah\Http\Cookie;
+use Meulah\Http\SameSite;
+
+$cookie = Cookie::make(
+    name: 'theme',
+    value: 'dark',
+    expires: new DateTimeImmutable('+30 days'),
+    path: '/',
+    secure: true,
+    httpOnly: true,
+    sameSite: SameSite::Lax,
+);
+
+return Response::html('Saved')->withCookie($cookie);
+```
+
+`withCookie()` returns a new response. Multiple calls retain multiple cookies and `send()` emits each one as a separate `Set-Cookie` header. Cookie values are percent-encoded during serialization. Invalid names, CR/LF injection, unsafe paths, unsupported SameSite values, `SameSite=None` without `Secure`, and expiration years outside 1601 through 9999 are rejected before a response can be sent.
+
+Sessions remain an explicit application choice. Bind the contract to the native PHP driver in application bootstrap when session state is needed:
+
+```php
+use Meulah\Session\NativeSession;
+use Meulah\Session\Session;
+
+$container->singleton(
+    Session::class,
+    static fn (): Session => new NativeSession(
+        name: 'MEULAHSESSID',
+        secure: true,
+        httpOnly: true,
+        sameSite: SameSite::Lax,
+    ),
+);
+```
+
+`NativeSession` starts lazily on the first session operation; reading a request cookie never starts it. It enables PHP strict session IDs, cookie-only transport, disabled URL ID propagation, HttpOnly cookies, and SameSite protection. Its default cookie is Secure; local plain-HTTP development must opt out explicitly with `secure: false`.
+
+```php
+$user = $session->get('user');
+$session->put('user', $user);
+$session->remove('temporary');
+$session->regenerate();
+$session->invalidate();
+$session->flash('notice', 'Profile saved.');
+```
+
+`regenerate()` rotates the identifier while preserving data. `invalidate()` clears all session data and rotates the identifier. Flash data is available during the request that creates it and the following request, then is removed when the next request starts. Session operations must happen before response output is sent.
+
+Only the native PHP driver exists in this milestone. Its persistence is controlled by PHP's configured session save handler. File, database, and Redis drivers remain future adapters behind the same `Session` contract.
+
+## CSRF protection
+
+Session-backed forms must register CSRF middleware globally. Use the same session instance for the form helper and middleware:
+
+~~~php
+use Meulah\Security\Csrf\Csrf;
+use Meulah\Security\Csrf\VerifyCsrfToken;
+
+$csrf = new Csrf($session);
+
+$app->middleware(new VerifyCsrfToken(
+    $session,
+    except: ['/webhooks/payment-provider'],
+));
+~~~
+
+Render the hidden field inside every state-changing server-rendered form:
+
+~~~php
+<form method="POST" action="/profile">
+    <?= $csrf->field() ?>
+</form>
+~~~
+
+The generated token contains 256 bits of cryptographic randomness, is stored in the session, and is compared with hash_equals(). It is bound to the current session identifier. After regenerate() or invalidate() rotates that identifier, the next CSRF access creates a new token and the previous token no longer validates.
+
+VerifyCsrfToken requires a valid token for every method except GET, HEAD, and OPTIONS. Method spoofing happens first, so forms representing PUT, PATCH, or DELETE are protected as unsafe requests.
+
+JavaScript clients may send the token through the documented header:
+
+~~~text
+X-CSRF-Token: <token>
+~~~
+
+The middleware reads ordinary forms only from the _token field. If both the field and header are supplied, they must agree. Missing, malformed, stale, or conflicting tokens produce a 419 Page Expired response; JSON clients receive the stable csrf_token_mismatch error code.
+
+Exclusions are exact normalized paths:
+
+~~~php
+new VerifyCsrfToken($session, except: [
+    '/webhooks/payment-provider',
+]);
+~~~
+
+Wildcards, route parameters, prefixes, and query-string conditions are rejected. Each excluded endpoint must therefore be an explicit security decision.
+
+## Validation
+
+Validation produces separate application data and never mutates the request. `Validator` is a concrete, stateless class, so it can be constructed directly or injected through Meulah's container:
+
+```php
+use Meulah\Validation\Validator;
+
+$result = $validator->validate(
+    $request->allInput(),
+    [
+        'name' => ['required', 'string', 'min:2', 'max:100'],
+        'email' => ['required', 'email'],
+        'age' => ['nullable', 'integer', 'min:18'],
+    ],
+);
+
+if (!$result->isValid()) {
+    $errors = $result->errors();
+    $emailError = $result->error('email');
+}
+
+$data = $result->validated();
+```
+
+`validated()` contains only fields declared in the rule set that passed all their rules. Optional missing fields and unrelated input are omitted. A present nullable field is retained as `null`.
+
+Use `validateOrFail()` when the request should stop immediately:
+
+```php
+$data = $validator->validateOrFail(
+    $request->allInput(),
+    ['email' => ['required', 'email']],
+);
+```
+
+Failure throws `Meulah\Validation\ValidationException`. The application exception handler renders it as HTTP `422`; JSON responses include field errors under `error.fields`.
+
+The initial rule set is intentionally small:
+
+- Presence: `required`, `present`, `nullable`
+- Types: `string`, `integer`, `boolean`, `array`, `email`
+- Size and value: `min`, `max`, `between`, `in`
+- Relationships: `same`, `confirmed`
+- Uploads: `file`, `max_size`, `detected_mime`
+
+Rules use colon-separated parameters:
+
+```php
+[
+    'role' => ['in:admin,editor,viewer'],
+    'password' => ['confirmed'],
+    'password_confirmation' => ['present'],
+    'backup_email' => ['same:email'],
+]
+```
+
+`confirmed` compares a field with `{field}_confirmation`, while `same:other` compares it with another named input field. Comparisons are strict.
+
+For strings, `min`, `max`, and `between` measure Unicode characters; for arrays they measure item count; for integers they compare the numeric value. Canonical form strings are normalized only when an explicit type rule requests it:
+
+- `integer` accepts integers and canonical strings such as `"18"` or `"-2"` and returns an integer.
+- `boolean` accepts booleans, `0`, `1`, `"0"`, `"1"`, `"false"`, and `"true"` and returns a boolean.
+- Values such as `"twenty"`, `"18 years"`, `"yes"`, empty strings, and arbitrary arrays are never loosely cast.
+
+Uploads are intentionally not part of `allInput()`. Pass selected files explicitly:
+
+```php
+$data = $validator->validateOrFail(
+    [
+        ...$request->allInput(),
+        'avatar' => $request->file('avatar'),
+    ],
+    [
+        'avatar' => [
+            'required',
+            'file',
+            'max_size:2097152',
+            'detected_mime:image/jpeg,image/png',
+        ],
+    ],
+);
+```
+
+`max_size` is an explicit byte limit. `detected_mime` uses server-side file inspection rather than the client-supplied media type. Unknown rules and malformed parameters throw `InvalidArgumentException` immediately because they are programming errors, not user input errors.
+
 ## Middleware
 
 Middleware can inspect a request, return a response immediately, or delegate to the next handler. The first registered middleware is the outermost layer:
@@ -216,6 +440,49 @@ $router
 ```
 
 Middleware must return a `Response`. It may short-circuit the pipeline without calling `$next`, which is useful for authentication, authorization, maintenance mode, CORS preflight, and rate limiting. Exceptions thrown anywhere in the pipeline are rendered by Meulah's configured exception handler.
+
+## Events
+
+The application owns one synchronous event dispatcher and registers it in the container under EventDispatcher:
+
+~~~php
+use Meulah\Event\EventDispatcher;
+
+$events = $app->events();
+$sameDispatcher = $app->container()->get(EventDispatcher::class);
+~~~
+
+Register listeners explicitly against one concrete event class:
+
+~~~php
+$events->listen(UserRegistered::class, SendWelcomeEmail::class);
+$events->listen(UserRegistered::class, function (UserRegistered $event): void {
+    // Additional synchronous work.
+});
+
+$event = new UserRegistered($user);
+$returned = $events->dispatch($event);
+~~~
+
+Listener classes must be invokable. They are resolved through the application container when dispatched, so constructor dependencies and configured singleton lifetimes work normally:
+
+~~~php
+final class SendWelcomeEmail
+{
+    public function __construct(private readonly Mailer $mailer)
+    {
+    }
+
+    public function __invoke(UserRegistered $event): void
+    {
+        $this->mailer->sendWelcomeMessage($event->user);
+    }
+}
+~~~
+
+Dispatch is synchronous and listeners run in registration order. Listener return values are ignored, dispatch() returns the same event object, and an exception immediately stops dispatch and propagates to the caller.
+
+Matching is intentionally exact: listeners registered for another class or parent type are not discovered. This version has no queues, event discovery, wildcard listeners, subscribers, realtime broadcasting, annotations, or attributes.
 
 ## Configuration
 
@@ -274,6 +541,10 @@ return new class implements Migration {
 Create and manage migrations with the dependency-free CLI:
 
 ```bash
+php meulah
+php meulah list
+php meulah help migrate
+php meulah migrate --help
 php meulah make:migration create_users_table
 php meulah migrate
 php meulah migrate:status
@@ -283,6 +554,19 @@ php meulah migrate:fresh
 ```
 
 The starter's root `meulah` launcher passes its application root directly to the single framework CLI implementation. The framework also exposes `vendor/bin/meulah`; that entry point honors `MEULAH_APPLICATION_ROOT`, searches upward from the current directory, and then checks its Composer installation relationship. Discovery accepts only projects with the starter's explicit `extra.meulah.application` marker and expected bootstrap, configuration, and route structure.
+
+Console features are individual objects implementing `Meulah\Console\Command`. `ConsoleApplication` owns only registration and dispatch, while the launcher composes the built-in migration commands for an application root. `Input` exposes positional arguments and long options and `Output` separates ordinary and error output. Applications can add custom commands without modifying the dispatcher:
+
+```php
+use Meulah\Console\Application;
+
+$console = new Application(__DIR__);
+$console->add(new ReportCommand());
+
+exit($console->run($argv));
+```
+
+An unknown command returns a non-zero status and suggests close registered names. Command execution is non-interactive; options must be supplied explicitly.
 
 `migrate` runs only files not recorded in the migration history table. All migrations from one invocation share a batch number, and `migrate:rollback` reverses the most recent batch in reverse filename order. `migrate:reset` rolls back every recorded batch. `migrate:fresh` drops every table—including tables not managed by migrations—and then reruns all migrations. A recorded migration whose file has been removed appears as `Missing` in the status output.
 

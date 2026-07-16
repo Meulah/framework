@@ -6,6 +6,8 @@ namespace Meulah;
 
 use Meulah\Container\Container;
 use Meulah\Config\Repository;
+use Meulah\Event\EventDispatcher;
+use Meulah\Event\SynchronousEventDispatcher;
 use Meulah\Exception\ExceptionHandler;
 use Meulah\Http\CallableRequestHandler;
 use Meulah\Http\Middleware;
@@ -20,6 +22,7 @@ final class Application
 {
     private readonly Repository $config;
     private readonly ExceptionHandler $exceptions;
+    private readonly EventDispatcher $events;
     /** @var list<Middleware> */
     private array $middleware = [];
 
@@ -27,12 +30,18 @@ final class Application
         private readonly Router $router,
         ?Repository $config = null,
         ?ExceptionHandler $exceptions = null,
+        ?EventDispatcher $events = null,
     ) {
         $this->config = $config ?? new Repository();
         $this->exceptions = $exceptions ?? new ExceptionHandler(false, new ErrorLogLogger());
+        $this->events = $events
+            ?? ($this->container()->has(EventDispatcher::class)
+                ? $this->container()->get(EventDispatcher::class)
+                : new SynchronousEventDispatcher($this->container()));
         $this->container()->instance(self::class, $this);
         $this->container()->instance(Repository::class, $this->config);
         $this->container()->instance(ExceptionHandler::class, $this->exceptions);
+        $this->container()->instance(EventDispatcher::class, $this->events);
     }
 
     public function router(): Router
@@ -48,6 +57,11 @@ final class Application
     public function container(): Container
     {
         return $this->router->container();
+    }
+
+    public function events(): EventDispatcher
+    {
+        return $this->events;
     }
 
     public function middleware(Middleware ...$middleware): self

@@ -11,6 +11,7 @@ final class Request
 {
     private bool $jsonDecoded = false;
     private mixed $decodedJson = null;
+    private readonly string $originalMethod;
     private readonly string $method;
     private readonly string $path;
 
@@ -34,9 +35,10 @@ final class Request
             throw new BadRequest('Request body is too large.', 'payload_too_large', status: 413);
         }
 
-        $this->method = strtoupper($method);
-        $this->path = self::normalizePath($path);
         $this->headers = self::normalizeHeaders($headers);
+        $this->originalMethod = strtoupper($method);
+        $this->method = $this->resolveMethod($this->originalMethod);
+        $this->path = self::normalizePath($path);
     }
 
     /** @var array<string, string> */
@@ -88,6 +90,11 @@ final class Request
     public function method(): string
     {
         return $this->method;
+    }
+
+    public function originalMethod(): string
+    {
+        return $this->originalMethod;
     }
 
     public function path(): string
@@ -403,6 +410,53 @@ final class Request
         $path = '/' . trim(rawurldecode($path), '/');
 
         return $path === '/' ? '/' : rtrim($path, '/');
+    }
+
+    private function resolveMethod(string $method): string
+    {
+        if ($method !== 'POST') {
+            return $method;
+        }
+
+        $formOverride = array_key_exists('_method', $this->body)
+            ? $this->normalizeMethodOverride($this->body['_method'], '_method form field')
+            : null;
+        $headerOverride = array_key_exists('x-http-method-override', $this->headers)
+            ? $this->normalizeMethodOverride(
+                $this->headers['x-http-method-override'],
+                'X-HTTP-Method-Override header',
+            )
+            : null;
+
+        if ($formOverride !== null && $headerOverride !== null && $formOverride !== $headerOverride) {
+            throw new BadRequest(
+                'The request contains conflicting method overrides.',
+                'invalid_method_override',
+            );
+        }
+
+        return $formOverride ?? $headerOverride ?? $method;
+    }
+
+    private function normalizeMethodOverride(mixed $value, string $source): string
+    {
+        if (!is_string($value)) {
+            throw new BadRequest(
+                sprintf('The %s must be a string.', $source),
+                'invalid_method_override',
+            );
+        }
+
+        $method = strtoupper(trim($value));
+
+        if (!in_array($method, ['PUT', 'PATCH', 'DELETE'], true)) {
+            throw new BadRequest(
+                sprintf('The %s must be PUT, PATCH, or DELETE.', $source),
+                'invalid_method_override',
+            );
+        }
+
+        return $method;
     }
 
     private static function normalizeHeaders(array $headers): array

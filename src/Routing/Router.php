@@ -7,6 +7,7 @@ namespace Meulah\Routing;
 use InvalidArgumentException;
 use Meulah\Container\Container;
 use Meulah\Http\CallableRequestHandler;
+use Meulah\Http\Middleware;
 use Meulah\Http\MiddlewarePipeline;
 use Meulah\Http\Request;
 use Meulah\Http\Response;
@@ -23,6 +24,11 @@ final class Router
 
     /** @var array<string, Route> */
     private array $namedRoutes = [];
+
+    /**
+     * @var list<array{prefix: string, name: string, middleware: list<Middleware>}>
+     */
+    private array $groups = [];
 
     private readonly Container $container;
 
@@ -47,9 +53,76 @@ final class Router
         return $this->add(['POST'], $path, $handler, $name);
     }
 
+    public function put(string $path, callable|array|string $handler, ?string $name = null): Route
+    {
+        return $this->add(['PUT'], $path, $handler, $name);
+    }
+
+    public function patch(string $path, callable|array|string $handler, ?string $name = null): Route
+    {
+        return $this->add(['PATCH'], $path, $handler, $name);
+    }
+
+    public function delete(string $path, callable|array|string $handler, ?string $name = null): Route
+    {
+        return $this->add(['DELETE'], $path, $handler, $name);
+    }
+
+    public function options(string $path, callable|array|string $handler, ?string $name = null): Route
+    {
+        return $this->add(['OPTIONS'], $path, $handler, $name);
+    }
+
     public function match(array $methods, string $path, callable|array|string $handler, ?string $name = null): Route
     {
         return $this->add($methods, $path, $handler, $name);
+    }
+
+    /**
+     * @param array{prefix?: string, name?: string, middleware?: list<Middleware>} $attributes
+     */
+    public function group(array $attributes, callable $routes): self
+    {
+        $unknown = array_diff(array_keys($attributes), ['prefix', 'name', 'middleware']);
+
+        if ($unknown !== []) {
+            throw new InvalidArgumentException(sprintf(
+                'Unknown route group attribute%s: %s.',
+                count($unknown) === 1 ? '' : 's',
+                implode(', ', $unknown),
+            ));
+        }
+
+        $prefix = $attributes['prefix'] ?? '';
+        $name = $attributes['name'] ?? '';
+        $middleware = $attributes['middleware'] ?? [];
+
+        if (!is_string($prefix) || !is_string($name) || !is_array($middleware)) {
+            throw new InvalidArgumentException(
+                'Route group prefix and name must be strings, and middleware must be an array.',
+            );
+        }
+
+        foreach ($middleware as $item) {
+            if (!$item instanceof Middleware) {
+                throw new InvalidArgumentException('Route group middleware must implement Middleware.');
+            }
+        }
+
+        $parent = $this->currentGroup();
+        $this->groups[] = [
+            'prefix' => $this->joinPaths($parent['prefix'], $prefix),
+            'name' => $parent['name'] . $name,
+            'middleware' => [...$parent['middleware'], ...array_values($middleware)],
+        ];
+
+        try {
+            $routes($this);
+        } finally {
+            array_pop($this->groups);
+        }
+
+        return $this;
     }
 
     public function url(string $name, array $parameters = [], array $query = []): string
@@ -83,11 +156,27 @@ final class Router
 
         $path = preg_replace_callback(
             '/\{([A-Za-z_][A-Za-z0-9_]*)\}/',
-            fn (array $match): string => rawurlencode($this->stringifyParameter(
-                $name,
-                $match[1],
-                $parameters[$match[1]],
-            )),
+            function (array $match) use ($name, $parameters, $route): string {
+                $value = $this->stringifyParameter(
+                    $name,
+                    $match[1],
+                    $parameters[$match[1]],
+                );
+                $constraint = $route->constraints()[$match[1]] ?? null;
+
+                if (
+                    $constraint !== null
+                    && preg_match('#^(?:' . str_replace('#', '\\#', $constraint) . ')$#', $value) !== 1
+                ) {
+                    throw new UrlGenerationException(sprintf(
+                        "Path parameter '%s' for route '%s' does not satisfy its constraint.",
+                        $match[1],
+                        $name,
+                    ));
+                }
+
+                return rawurlencode($value);
+            },
             $route->path,
         );
 
@@ -105,7 +194,7 @@ final class Router
         $allowed = [];
 
         foreach ($this->routes as $route) {
-            $parameters = $this->matchPath($route->path, $request->path());
+            $parameters = $this->matchPath($route, $request->path());
 
             if ($parameters === null) {
                 continue;
@@ -148,11 +237,16 @@ final class Router
             throw new InvalidArgumentException('A route needs at least one HTTP method.');
         }
 
-        $path = '/' . trim($path, '/');
+        $group = $this->currentGroup();
+        $path = $this->joinPaths($group['prefix'], $path);
         $name = $name === null ? null : trim($name);
 
         if ($name === '') {
             throw new InvalidArgumentException('A named route needs a non-empty name.');
+        }
+
+        if ($name !== null) {
+            $name = $group['name'] . $name;
         }
 
         if ($name !== null && isset($this->namedRoutes[$name])) {
@@ -166,6 +260,11 @@ final class Router
         }
 
         $route = new Route($methods, $path === '/' ? '/' : rtrim($path, '/'), $handler, $name);
+
+        if ($group['middleware'] !== []) {
+            $route->middleware(...$group['middleware']);
+        }
+
         $this->routes[] = $route;
 
         if ($name !== null) {
@@ -218,22 +317,47 @@ final class Router
         return $value;
     }
 
-    private function matchPath(string $routePath, string $requestPath): ?array
+    private function matchPath(Route $route, string $requestPath): ?array
     {
         $parameterNames = [];
-        $quoted = preg_quote($routePath, '#');
-        $pattern = preg_replace_callback('/\\\\\{([A-Za-z_][A-Za-z0-9_]*)\\\\\}/', function (array $match) use (&$parameterNames): string {
+        $constraints = $route->constraints();
+        $quoted = preg_quote($route->path, '#');
+        $pattern = preg_replace_callback('/\\\\\{([A-Za-z_][A-Za-z0-9_]*)\\\\\}/', function (array $match) use (&$parameterNames, $constraints): string {
             $parameterNames[] = $match[1];
-            return '([^/]+)';
+            $constraint = $constraints[$match[1]] ?? '[^/]+';
+
+            return '(?P<' . $match[1] . '>' . str_replace('#', '\\#', $constraint) . ')';
         }, $quoted);
 
         if ($pattern === null || preg_match('#^' . $pattern . '$#', $requestPath, $matches) !== 1) {
             return null;
         }
 
-        array_shift($matches);
+        $parameters = [];
 
-        return array_combine($parameterNames, $matches) ?: [];
+        foreach ($parameterNames as $parameter) {
+            $parameters[$parameter] = $matches[$parameter];
+        }
+
+        return $parameters;
+    }
+
+    /** @return array{prefix: string, name: string, middleware: list<Middleware>} */
+    private function currentGroup(): array
+    {
+        return $this->groups[array_key_last($this->groups)] ?? [
+            'prefix' => '',
+            'name' => '',
+            'middleware' => [],
+        ];
+    }
+
+    private function joinPaths(string $prefix, string $path): string
+    {
+        $joined = trim($prefix, '/') . '/' . trim($path, '/');
+        $joined = '/' . trim($joined, '/');
+
+        return $joined === '/' ? '/' : rtrim($joined, '/');
     }
 
     private function resolveHandler(callable|array|string $handler): callable
