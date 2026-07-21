@@ -31,11 +31,14 @@ final class ConsoleApplication
 
         try {
             if (in_array($requested, ['list', '--help', '-h'], true)) {
+                $this->assertGlobalArgumentCount($arguments, 2, $requested);
+
                 return $this->renderList();
             }
 
             if ($requested === 'help') {
                 $commandName = $arguments[2] ?? null;
+                $this->assertGlobalArgumentCount($arguments, $commandName === null ? 2 : 3, 'help');
 
                 return $commandName === null
                     ? $this->renderList()
@@ -52,6 +55,16 @@ final class ConsoleApplication
             $input = Input::fromTokens($requested, $tokens);
 
             if ($input->hasOption('help') || in_array('-h', $input->arguments(), true)) {
+                $input->assertOnlyOptions(
+                    $input->hasOption('help') ? ['help'] : [],
+                );
+
+                if ($input->hasOption('help') && $input->option('help') !== true) {
+                    throw new ConsoleInputException(
+                        "Option '--help' is a flag and does not accept a value.",
+                    );
+                }
+
                 return $this->renderHelp($command);
             }
 
@@ -134,5 +147,20 @@ final class ConsoleApplication
         }
 
         return 1;
+    }
+
+    /** @param list<string> $arguments */
+    private function assertGlobalArgumentCount(array $arguments, int $maximum, string $command): void
+    {
+        $provided = count($arguments) - $maximum;
+
+        if (count($arguments) > $maximum) {
+            throw new ConsoleInputException(sprintf(
+                "Command '%s' does not accept %d additional argument%s.",
+                $command,
+                $provided,
+                $provided === 1 ? '' : 's',
+            ));
+        }
     }
 }

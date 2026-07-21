@@ -32,6 +32,9 @@ final class MigrateCommand implements Command
 
     public function execute(Input $input, Output $output): int
     {
+        $input->assertOnlyOptions(['path']);
+        $input->assertArgumentCount(0, 0);
+
         [$migrator, $migrations] = $this->context->migrator($input);
         $completed = $migrator->migrate($migrations);
 

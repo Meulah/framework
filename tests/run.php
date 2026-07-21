@@ -22,6 +22,7 @@ use Meulah\Database\MigrationFile;
 use Meulah\Database\MigrationRepository;
 use Meulah\Database\Migrator;
 use Meulah\Event\EventDispatcher;
+use Meulah\Event\EventDispatchException;
 use Meulah\Event\SynchronousEventDispatcher;
 use Meulah\Exception\ExceptionHandler;
 use Meulah\Http\Cookie;
@@ -56,11 +57,14 @@ use Meulah\Validation\ValidationRuleException;
 use Meulah\Validation\Validator;
 use Meulah\View\View;
 use Tests\Fixtures\CircularOne;
+use Tests\Fixtures\ChildEvent;
 use Tests\Fixtures\EventLog;
 use Tests\Fixtures\FriendlyGreeting;
 use Tests\Fixtures\Greeting;
 use Tests\Fixtures\GreetingController;
 use Tests\Fixtures\InvokableGreetingController;
+use Tests\Fixtures\MutableEvent;
+use Tests\Fixtures\ParentEvent;
 use Tests\Fixtures\ScalarDependencyController;
 use Tests\Fixtures\SendWelcomeEmail;
 use Tests\Fixtures\UserRegistered;
@@ -2089,6 +2093,110 @@ $test('event registration rejects unknown events and invalid class listeners', s
     $event = new UserRegistered('No listeners');
     $assertSame($event, $events->dispatch($event));
 });
+$test('events use exact classes while allowing compatible listener parameter types', static function () use ($assertSame): void {
+    $events = new SynchronousEventDispatcher();
+    $calls = [];
+    $events->listen(ParentEvent::class, static function (ParentEvent $event) use (&$calls): void {
+        $calls[] = $event::class;
+    });
+    $events->listen(ChildEvent::class, static function (ParentEvent $event) use (&$calls): void {
+        $calls[] = 'child-as-parent';
+    });
+    $events->listen(ChildEvent::class, static function (object $event) use (&$calls): void {
+        $calls[] = 'child-as-object';
+    });
+
+    $child = new ChildEvent();
+    $assertSame($child, $events->dispatch($child));
+    $assertSame(['child-as-parent', 'child-as-object'], $calls);
+
+    $parent = new ParentEvent();
+    $assertSame($parent, $events->dispatch($parent));
+    $assertSame([
+        'child-as-parent',
+        'child-as-object',
+        ParentEvent::class,
+    ], $calls);
+});
+
+$test('duplicate event listeners run once per explicit registration and may mutate events', static function () use ($assertSame): void {
+    $events = new SynchronousEventDispatcher();
+    $calls = 0;
+    $listener = static function (MutableEvent $event) use (&$calls): string {
+        $calls++;
+        $event->value .= ':' . $calls;
+        return 'ignored';
+    };
+    $events->listen(MutableEvent::class, $listener);
+    $events->listen(MutableEvent::class, $listener);
+    $event = new MutableEvent();
+
+    $returned = $events->dispatch($event);
+
+    $assertSame($event, $returned);
+    $assertSame(2, $calls);
+    $assertSame('initial:1:2', $event->value);
+});
+
+$test('event registration rejects incompatible and by-reference event parameters', static function () use ($assertSame): void {
+    $events = new SynchronousEventDispatcher();
+    $invalid = [
+        static function (string $event): void {
+        },
+        static function (stdClass $event): void {
+        },
+        static function (UserRegistered &$event): void {
+        },
+    ];
+
+    foreach ($invalid as $listener) {
+        try {
+            $events->listen(UserRegistered::class, $listener);
+            throw new RuntimeException('Expected incompatible listener rejection.');
+        } catch (InvalidArgumentException $exception) {
+            $assertSame(true, str_contains($exception->getMessage(), 'Event listener'));
+        }
+    }
+});
+
+$test('nested event dispatch is ordered and circular same-object dispatch is cleared safely', static function () use ($assertSame): void {
+    $events = new SynchronousEventDispatcher();
+    $calls = [];
+    $events->listen(stdClass::class, static function () use (&$calls): void {
+        $calls[] = 'inner';
+    });
+    $events->listen(UserRegistered::class, static function () use ($events, &$calls): void {
+        $calls[] = 'outer:before';
+        $events->dispatch(new stdClass());
+        $calls[] = 'outer:after';
+    });
+
+    $events->dispatch(new UserRegistered('Nested'));
+    $assertSame(['outer:before', 'inner', 'outer:after'], $calls);
+
+    $circular = new SynchronousEventDispatcher();
+    $recurse = true;
+    $circular->listen(UserRegistered::class, static function (UserRegistered $event) use ($circular, &$recurse): void {
+        if ($recurse) {
+            $recurse = false;
+            $circular->dispatch($event);
+        }
+    });
+    $event = new UserRegistered('Circular');
+
+    try {
+        $circular->dispatch($event);
+        throw new RuntimeException('Expected circular dispatch rejection.');
+    } catch (EventDispatchException $exception) {
+        $assertSame(
+            "Circular dispatch detected for event object 'Tests\\Fixtures\\UserRegistered'.",
+            $exception->getMessage(),
+        );
+    }
+
+    $assertSame($event, $circular->dispatch($event));
+});
+
 
 $test('route handler injection is strict and reports argument mismatches', static function () use ($assertSame): void {
     $router = new Router();
@@ -2101,6 +2209,205 @@ $test('route handler injection is strict and reports argument mismatches', stati
         $assertSame('Route handler requires 2 arguments; 1 provided.', $exception->getMessage());
     }
 });
+$test('route handlers reject inaccessible methods and unsupported route parameter types with context', static function () use ($assertSame): void {
+    $hidden = new class {
+        private function show(): string
+        {
+            return 'hidden';
+        }
+    };
+    $cases = [
+        [
+            '/hidden',
+            [$hidden, 'show'],
+            "Route handler 'class@anonymous::show' is not publicly callable.",
+            '/hidden',
+        ],
+        [
+            '/integer/{user}',
+            static fn (int $user): string => (string) $user,
+            "Route parameter 'user' cannot be passed to handler parameter '\$user' typed int; use string, mixed, or no type.",
+            '/integer/42',
+        ],
+        [
+            '/union/{user}',
+            static fn (string|int $user): string => (string) $user,
+            "Route parameter 'user' cannot be passed to handler parameter '\$user' typed string|int; use string, mixed, or no type.",
+            '/union/42',
+        ],
+        [
+            '/request-union',
+            static fn (Request|string $request): string => 'ambiguous',
+            'Request injection requires the first handler parameter to be typed exactly as Meulah\\Http\\Request.',
+            '/request-union',
+        ],
+        [
+            '/reference/{user}',
+            static function (string &$user): string {
+                return $user;
+            },
+            "Route parameter 'user' cannot be passed by reference to handler parameter '\$user'.",
+            '/reference/42',
+        ],
+        [
+            '/request-reference',
+            static function (Request &$request): string {
+                return 'request';
+            },
+            'The injected Request handler parameter cannot be passed by reference.',
+            '/request-reference',
+        ],
+    ];
+
+    foreach ($cases as $index => [$path, $handler, $message, $requestPath]) {
+        $router = new Router();
+        $router->get($path, $handler);
+
+        try {
+            $router->dispatch(new Request('GET', $requestPath));
+            throw new RuntimeException('Expected route handler rejection.');
+        } catch (RouteHandlerException $exception) {
+            if ($index === 0) {
+                $assertSame(true, str_ends_with($exception->getMessage(), '::show\' is not publicly callable.'));
+            } else {
+                $assertSame($message, $exception->getMessage());
+            }
+        }
+    }
+});
+
+$test('nested route groups normalize boundaries and preserve middleware declaration order', static function () use ($assertSame): void {
+    $makeMiddleware = static fn (): Middleware => new class implements Middleware {
+        public function process(Request $request, RequestHandler $next): ResponseInterface
+        {
+            return $next->handle($request);
+        }
+    };
+    $outer = $makeMiddleware();
+    $inner = $makeMiddleware();
+    $routeMiddleware = $makeMiddleware();
+    $router = new Router();
+
+    $router->group([
+        'prefix' => '/api/',
+        'name' => 'api.',
+        'middleware' => [$outer],
+    ], static function (Router $router) use ($inner, $routeMiddleware): void {
+        $router->group([
+            'prefix' => '/v1/',
+            'name' => 'v1.',
+            'middleware' => [$inner],
+        ], static function (Router $router) use ($routeMiddleware): void {
+            $router->get('/users/', static fn (): string => 'users', 'users.index')
+                ->middleware($routeMiddleware);
+        });
+    });
+
+    $route = $router->routes()[0];
+    $assertSame('/api/v1/users', $route->path);
+    $assertSame('api.v1.users.index', $route->name);
+    $assertSame([$outer, $inner, $routeMiddleware], $route->middlewareStack());
+    $assertSame('/api/v1/users', $router->url('api.v1.users.index'));
+});
+
+$test('duplicate method and normalized path registrations fail without polluting names', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->get('/accounts/', static fn (): string => 'first', 'accounts.index');
+    $router->post('/accounts', static fn (): string => 'post');
+
+    foreach ([
+        [['GET'], '/accounts', 'accounts.duplicate', 'GET'],
+        [['HEAD'], '/accounts/', 'accounts.head', 'HEAD'],
+    ] as [$methods, $path, $name, $method]) {
+        try {
+            $router->match($methods, $path, static fn (): string => 'duplicate', $name);
+            throw new RuntimeException('Expected duplicate route registration rejection.');
+        } catch (RouteDefinitionException $exception) {
+            $assertSame(true, str_contains($exception->getMessage(), "Route '/accounts' is already registered"));
+            $assertSame(true, str_contains($exception->getMessage(), $method));
+        }
+
+        try {
+            $router->url($name);
+            throw new RuntimeException('Expected failed route name not to be registered.');
+        } catch (UrlGenerationException) {
+        }
+    }
+});
+
+$test('static routes take precedence over earlier dynamic routes', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->get('/pages/{page}', static fn (string $page): string => 'dynamic:' . $page);
+    $router->get('/pages/create', static fn (): string => 'static');
+
+    $assertSame('static', $router->dispatch(new Request('GET', '/pages/create'))->content());
+    $assertSame('dynamic:about', $router->dispatch(new Request('GET', '/pages/about'))->content());
+});
+
+$test('GET routes provide HEAD fallback and stable Allow methods while OPTIONS stays explicit', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->match(['DELETE', 'POST', 'GET'], '/documents', static fn (): string => 'document');
+
+    $head = $router->dispatch(new Request('HEAD', '/documents'));
+    $assertSame(200, $head->status());
+    $assertSame('', $head->content());
+
+    foreach (['PUT', 'OPTIONS'] as $method) {
+        try {
+            $router->dispatch(new Request($method, '/documents'));
+            throw new RuntimeException('Expected method mismatch.');
+        } catch (MethodNotAllowed $exception) {
+            $assertSame(['GET', 'HEAD', 'POST', 'DELETE'], $exception->allowedMethods);
+        }
+    }
+
+    $router->options('/documents', static fn (): string => 'options');
+    $assertSame('options', $router->dispatch(new Request('OPTIONS', '/documents'))->content());
+});
+
+$test('route constraints use whole-segment matching with safe delimiter selection', static function () use ($assertSame): void {
+    $router = new Router();
+    $router->get('/codes/{code}', static fn (string $code): string => $code, 'codes.show')
+        ->where('code', '[A-F#]+');
+
+    $assertSame('AB#CD', $router->dispatch(new Request('GET', '/codes/AB%23CD'))->content());
+    $assertSame('/codes/AB%23CD', $router->url('codes.show', ['code' => 'AB#CD']));
+
+    foreach (['ABx', 'xAB'] as $invalid) {
+        try {
+            $router->dispatch(new Request('GET', '/codes/' . $invalid));
+            throw new RuntimeException('Expected whole-segment constraint mismatch.');
+        } catch (RouteNotFound) {
+        }
+    }
+});
+
+$test('route paths reject malformed parameters and preserve normalized path semantics', static function () use ($assertSame): void {
+    foreach (['/users/{}', '/users/{1user}', '/users/{user', '/users/user}'] as $path) {
+        try {
+            (new Router())->get($path, static fn (): string => 'invalid');
+            throw new RuntimeException('Expected invalid route pattern rejection.');
+        } catch (RouteDefinitionException $exception) {
+            $assertSame(true, str_contains($exception->getMessage(), 'invalid parameter pattern'));
+        }
+    }
+
+    $router = new Router();
+    $router->get('/trailing/', static fn (): string => 'trailing');
+    $router->get('/repeated//slash', static fn (): string => 'repeated');
+    $router->get('/encoded/slash', static fn (): string => 'encoded');
+
+    $assertSame('trailing', $router->dispatch(new Request('GET', '/trailing/'))->content());
+    $assertSame('repeated', $router->dispatch(new Request('GET', '/repeated//slash'))->content());
+    $assertSame('encoded', $router->dispatch(new Request('GET', '/encoded%2Fslash'))->content());
+
+    try {
+        $router->dispatch(new Request('GET', '/repeated/slash'));
+        throw new RuntimeException('Expected repeated slash to remain distinct.');
+    } catch (RouteNotFound) {
+    }
+});
+
 
 $test('router dispatches static routes', static function () use ($assertSame): void {
     $router = new Router();
@@ -2933,6 +3240,72 @@ $test('console input preserves arguments and explicit option values', static fun
     }
 });
 
+$test('console input exposes explicit command validation without coercion', static function () use ($assertSame): void {
+    $input = ConsoleInput::fromTokens('demo', ['value', '--path=', '--force=false']);
+
+    try {
+        $input->assertOnlyOptions(['path']);
+        throw new RuntimeException('Expected unknown option rejection.');
+    } catch (ConsoleInputException $exception) {
+        $assertSame("Unknown option '--force' for command 'demo'.", $exception->getMessage());
+    }
+
+    try {
+        $input->assertArgumentCount(0, 0);
+        throw new RuntimeException('Expected positional argument rejection.');
+    } catch (ConsoleInputException $exception) {
+        $assertSame("Command 'demo' expects no arguments; 1 given.", $exception->getMessage());
+    }
+
+    try {
+        $input->assertFlag('force');
+        throw new RuntimeException('Expected valued flag rejection.');
+    } catch (ConsoleInputException $exception) {
+        $assertSame("Option '--force' is a flag and does not accept a value.", $exception->getMessage());
+    }
+});
+
+$test('built-in console commands reject unknown options surplus arguments and malformed flags', static function () use ($assertSame): void {
+    $root = __DIR__ . '/fixtures/application';
+    $cases = [
+        [['meulah', 'migrate', '--unknown'], "Unknown option '--unknown' for command 'migrate'."],
+        [['meulah', 'migrate', 'unexpected'], "Command 'migrate' expects no arguments; 1 given."],
+        [
+            ['meulah', 'migrate', '--path', 'database/migrations'],
+            "Command 'migrate' expects no arguments; 1 given.",
+        ],
+        [
+            ['meulah', 'migrate:rollback', '--force=false'],
+            'Destructive migration commands require --force as a bare flag.',
+        ],
+        [
+            ['meulah', 'migrate', '--help', '--unknown'],
+            "Unknown option '--unknown' for command 'migrate'.",
+        ],
+        [
+            ['meulah', 'migrate', '--help=value'],
+            "Option '--help' is a flag and does not accept a value.",
+        ],
+        [
+            ['meulah', 'list', 'unexpected'],
+            "Command 'list' does not accept 1 additional argument.",
+        ],
+        [
+            ['meulah', 'help', 'migrate', 'unexpected'],
+            "Command 'help' does not accept 1 additional argument.",
+        ],
+    ];
+
+    foreach ($cases as [$arguments, $message]) {
+        $output = ConsoleOutput::buffered();
+        $status = (new ConsoleEntrypoint($root, $output))->run($arguments);
+
+        $assertSame(1, $status);
+        $assertSame('', $output->output());
+        $assertSame('Error: ' . $message . PHP_EOL, $output->errorOutput());
+    }
+});
+
 $test('migration path overrides preserve Unix and Windows filesystem roots', static function () use ($assertSame): void {
     $context = new \Meulah\Console\MigrationContext(__DIR__ . '/fixtures/application');
     $windowsRoot = 'C:\\';
@@ -3005,6 +3378,11 @@ $test('command registry resolves aliases rejects collisions and sorts commands',
     } catch (InvalidArgumentException $exception) {
         $assertSame("Command 'duplicate-alias' has duplicate aliases.", $exception->getMessage());
     }
+
+    $suggestions = new CommandRegistry();
+    $suggestions->add($makeCommand('cat'));
+    $suggestions->add($makeCommand('bat'));
+    $assertSame(['bat', 'cat'], $suggestions->suggestions('hat'));
 });
 
 $test('console output separates and captures stdout and stderr without ANSI', static function () use ($assertSame): void {

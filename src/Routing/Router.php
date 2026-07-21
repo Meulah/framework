@@ -14,6 +14,7 @@ use Meulah\Http\Response;
 use Meulah\Http\ResponseInterface;
 use ReflectionFunction;
 use ReflectionNamedType;
+use ReflectionType;
 use Stringable;
 use UnexpectedValueException;
 
@@ -168,7 +169,7 @@ final class Router
 
                 if (
                     $constraint !== null
-                    && preg_match('#^(?:' . str_replace('#', '\\#', $constraint) . ')$#', $value) !== 1
+                    && !RouteConstraint::matches($match[1], $constraint, $value)
                 ) {
                     throw new UrlGenerationException(sprintf(
                         "Path parameter '%s' for route '%s' does not satisfy its constraint.",
@@ -195,7 +196,7 @@ final class Router
     {
         $allowed = [];
 
-        foreach ($this->routes as $route) {
+        foreach ($this->routesInMatchingOrder() as $route) {
             $parameters = $this->matchPath($route, $request->path());
 
             if ($parameters === null) {
@@ -210,7 +211,7 @@ final class Router
             $handler = $this->resolveHandler($route->handler);
             $destination = new CallableRequestHandler(
                 fn (Request $request): ResponseInterface => $this->toResponse(
-                    $this->invokeHandler($handler, $request, array_values($parameters)),
+                    $this->invokeHandler($handler, $request, $parameters),
                 ),
             );
             $response = (new MiddlewarePipeline($route->middlewareStack(), $destination))->handle($request);
@@ -219,7 +220,7 @@ final class Router
         }
 
         if ($allowed !== []) {
-            throw new MethodNotAllowed(array_values(array_unique($allowed)));
+            throw new MethodNotAllowed($this->sortMethods(array_values(array_unique($allowed))));
         }
 
         throw new RouteNotFound(sprintf('No route matches %s.', $request->path()));
@@ -245,6 +246,12 @@ final class Router
 
         $methods = array_values(array_unique($normalizedMethods));
 
+        if (in_array('GET', $methods, true) && !in_array('HEAD', $methods, true)) {
+            $methods[] = 'HEAD';
+        }
+
+        $methods = $this->sortMethods($methods);
+
         if ($methods === []) {
             throw new RouteDefinitionException('A route needs at least one HTTP method.');
         }
@@ -259,10 +266,11 @@ final class Router
         ) {
             throw new RouteDefinitionException('Route paths cannot contain controls, queries, or fragments.');
         }
+
         $name = $name === null ? null : trim($name);
 
         if ($name === '') {
-            throw new InvalidArgumentException('A named route needs a non-empty name.');
+            throw new RouteDefinitionException('A named route needs a non-empty name.');
         }
 
         if ($name !== null) {
@@ -270,16 +278,32 @@ final class Router
         }
 
         if ($name !== null && isset($this->namedRoutes[$name])) {
-            throw new InvalidArgumentException(sprintf("Route name '%s' is already registered.", $name));
+            throw new RouteDefinitionException(sprintf("Route name '%s' is already registered.", $name));
         }
 
+        $this->assertValidPathPattern($path);
         $parameterNames = $this->pathParameterNames($path);
 
         if (count($parameterNames) !== count(array_unique($parameterNames))) {
-            throw new InvalidArgumentException('Route path parameter names must be unique.');
+            throw new RouteDefinitionException('Route path parameter names must be unique.');
         }
 
-        $route = new Route($methods, $path === '/' ? '/' : rtrim($path, '/'), $handler, $name);
+        $path = $path === '/' ? '/' : rtrim($path, '/');
+
+        foreach ($this->routes as $registered) {
+            $duplicates = array_values(array_intersect($registered->methods, $methods));
+
+            if ($registered->path === $path && $duplicates !== []) {
+                throw new RouteDefinitionException(sprintf(
+                    "Route '%s' is already registered for method%s %s.",
+                    $path,
+                    count($duplicates) === 1 ? '' : 's',
+                    implode(', ', $this->sortMethods($duplicates)),
+                ));
+            }
+        }
+
+        $route = new Route($methods, $path, $handler, $name);
 
         if ($group['middleware'] !== []) {
             $route->middleware(...$group['middleware']);
@@ -342,11 +366,10 @@ final class Router
         $parameterNames = [];
         $constraints = $route->constraints();
         $quoted = preg_quote($route->path, '#');
-        $pattern = preg_replace_callback('/\\\\\{([A-Za-z_][A-Za-z0-9_]*)\\\\\}/', function (array $match) use (&$parameterNames, $constraints): string {
+        $pattern = preg_replace_callback('/\\\\\{([A-Za-z_][A-Za-z0-9_]*)\\\\\}/', function (array $match) use (&$parameterNames): string {
             $parameterNames[] = $match[1];
-            $constraint = $constraints[$match[1]] ?? '[^/]+';
 
-            return '(?P<' . $match[1] . '>' . str_replace('#', '\\#', $constraint) . ')';
+            return '(?P<' . $match[1] . '>[^/]+)';
         }, $quoted);
 
         if ($pattern === null || preg_match('#^' . $pattern . '$#', $requestPath, $matches) !== 1) {
@@ -356,7 +379,14 @@ final class Router
         $parameters = [];
 
         foreach ($parameterNames as $parameter) {
-            $parameters[$parameter] = $matches[$parameter];
+            $value = $matches[$parameter];
+            $constraint = $constraints[$parameter] ?? null;
+
+            if ($constraint !== null && !RouteConstraint::matches($parameter, $constraint, $value)) {
+                return null;
+            }
+
+            $parameters[$parameter] = $value;
         }
 
         return $parameters;
@@ -389,7 +419,10 @@ final class Router
         }
 
         if (!is_callable($handler)) {
-            throw new InvalidArgumentException('The route handler is not callable.');
+            throw new RouteHandlerException(sprintf(
+                "Route handler '%s' is not publicly callable.",
+                $this->describeHandler($handler),
+            ));
         }
 
         return $handler;
@@ -412,11 +445,25 @@ final class Router
         $reflection = new ReflectionFunction(\Closure::fromCallable($handler));
         $firstParameter = $reflection->getParameters()[0] ?? null;
         $type = $firstParameter?->getType();
+
+        if ($type !== null && !$type instanceof ReflectionNamedType && $this->typeContainsRequest($type)) {
+            throw new RouteHandlerException(
+                'Request injection requires the first handler parameter to be typed exactly as Meulah\\Http\\Request.',
+            );
+        }
+
         $acceptsRequest = $type instanceof ReflectionNamedType
             && !$type->isBuiltin()
             && $type->getName() === Request::class;
 
-        $arguments = $acceptsRequest ? [$request, ...$parameters] : $parameters;
+        if ($acceptsRequest && $firstParameter?->isPassedByReference()) {
+            throw new RouteHandlerException(
+                'The injected Request handler parameter cannot be passed by reference.',
+            );
+        }
+
+        $parameterValues = array_values($parameters);
+        $arguments = $acceptsRequest ? [$request, ...$parameterValues] : $parameterValues;
         $maximum = $reflection->getNumberOfParameters();
         $provided = count($arguments);
 
@@ -436,6 +483,137 @@ final class Router
             ));
         }
 
+        $this->assertSupportedRouteParameterTypes(
+            $reflection->getParameters(),
+            array_keys($parameters),
+            $acceptsRequest,
+        );
+
         return $handler(...$arguments);
+    }
+
+    private function assertValidPathPattern(string $path): void
+    {
+        $withoutParameters = preg_replace('/\{[A-Za-z_][A-Za-z0-9_]*\}/', '', $path);
+
+        if (
+            $withoutParameters === null
+            || str_contains($withoutParameters, '{')
+            || str_contains($withoutParameters, '}')
+        ) {
+            throw new RouteDefinitionException(sprintf(
+                "Route path '%s' contains an invalid parameter pattern.",
+                $path,
+            ));
+        }
+    }
+
+    /** @return list<Route> */
+    private function routesInMatchingOrder(): array
+    {
+        $static = [];
+        $dynamic = [];
+
+        foreach ($this->routes as $route) {
+            if ($this->pathParameterNames($route->path) === []) {
+                $static[] = $route;
+            } else {
+                $dynamic[] = $route;
+            }
+        }
+
+        return [...$static, ...$dynamic];
+    }
+
+    /** @param list<string> $methods @return list<string> */
+    private function sortMethods(array $methods): array
+    {
+        $order = array_flip(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+
+        usort($methods, static function (string $left, string $right) use ($order): int {
+            $leftOrder = $order[$left] ?? PHP_INT_MAX;
+            $rightOrder = $order[$right] ?? PHP_INT_MAX;
+
+            return $leftOrder === $rightOrder
+                ? strcmp($left, $right)
+                : $leftOrder <=> $rightOrder;
+        });
+
+        return $methods;
+    }
+
+    private function describeHandler(mixed $handler): string
+    {
+        if (is_array($handler)) {
+            $target = $handler[0] ?? 'unknown';
+            $method = $handler[1] ?? 'unknown';
+            $target = is_object($target) ? $target::class : (is_string($target) ? $target : get_debug_type($target));
+            $method = is_string($method) ? $method : get_debug_type($method);
+
+            return $target . '::' . $method;
+        }
+
+        if (is_object($handler)) {
+            return $handler::class;
+        }
+
+        return is_string($handler) ? $handler : get_debug_type($handler);
+    }
+
+    private function typeContainsRequest(ReflectionType $type): bool
+    {
+        return in_array(Request::class, preg_split('/[|&]/', (string) $type) ?: [], true);
+    }
+
+    /**
+     * @param list<\ReflectionParameter> $handlerParameters
+     * @param list<string> $routeParameters
+     */
+    private function assertSupportedRouteParameterTypes(
+        array $handlerParameters,
+        array $routeParameters,
+        bool $acceptsRequest,
+    ): void {
+        $offset = $acceptsRequest ? 1 : 0;
+        $last = $handlerParameters[array_key_last($handlerParameters)] ?? null;
+
+        foreach ($routeParameters as $index => $routeParameter) {
+            $position = $offset + $index;
+            $handlerParameter = $handlerParameters[$position] ?? null;
+
+            if ($handlerParameter === null && $last?->isVariadic()) {
+                $handlerParameter = $last;
+            }
+
+            if ($handlerParameter === null) {
+                continue;
+            }
+
+            if ($handlerParameter->isPassedByReference()) {
+                throw new RouteHandlerException(sprintf(
+                    "Route parameter '%s' cannot be passed by reference to handler parameter '$%s'.",
+                    $routeParameter,
+                    $handlerParameter->getName(),
+                ));
+            }
+
+            $type = $handlerParameter->getType();
+
+            if (
+                $type === null
+                || ($type instanceof ReflectionNamedType
+                    && $type->isBuiltin()
+                    && in_array($type->getName(), ['string', 'mixed'], true))
+            ) {
+                continue;
+            }
+
+            throw new RouteHandlerException(sprintf(
+                "Route parameter '%s' cannot be passed to handler parameter '$%s' typed %s; use string, mixed, or no type.",
+                $routeParameter,
+                $handlerParameter->getName(),
+                (string) $type,
+            ));
+        }
     }
 }

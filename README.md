@@ -49,6 +49,10 @@ $router->get('/', static fn (): Response => Response::html('<h1>Hello</h1>'), 'h
 The router provides `get()`, `post()`, `put()`, `patch()`, `delete()`, and `options()` for ordinary HTTP routes. Use `match()` when one handler intentionally accepts a specific set of methods.
 Route methods must be valid HTTP token strings; empty values, control characters, and header-like method text are rejected when routes are registered. Route paths cannot contain control characters, query strings, or fragments.
 
+Route registration is deterministic. A second registration with an overlapping method and the same normalized path throws `RouteDefinitionException`; GET registrations include HEAD for this check. Duplicate names also fail instead of replacing the earlier route. When both a static and dynamic route match the same method, static routes are evaluated first regardless of declaration order. Routes of the same kind retain declaration order.
+
+One trailing slash is normalized away, including across nested group boundaries. Repeated internal slashes remain distinct. Request paths are percent-decoded exactly once before routing, so an encoded slash becomes a path separator; encode a literal percent sign when `%2F` must remain segment data. `Request::capture()` removes the installed application subdirectory before dispatch.
+
 Related routes can share a path prefix, name prefix, and middleware. Groups may be nested; parent attributes are applied before child attributes:
 
 ```php
@@ -74,7 +78,7 @@ $router
 ```
 
 Constraints only select routes and pass the matched string to the handler. Meulah does not perform implicit route-model binding.
-Constraint fragments may use ordinary capture groups, but named captures are rejected because they can collide with Meulah's internal route-parameter captures.
+Constraint fragments are validated when registered and matched against the entire decoded path segment with `\A` and `\z` anchors. Ordinary capture groups are allowed, but named captures are rejected because they can collide with Meulah's internal route-parameter captures. Meulah selects a delimiter absent from the fragment rather than rewriting user regular expressions.
 
 The optional final argument names a route. Generate root-relative URLs through the router rather than hard-coding application paths:
 
@@ -91,7 +95,9 @@ $url = $router->url(
 
 Path parameters are required by name and encoded as URL segments. A single parameter cannot contain `/` or `\`; model multi-segment paths as separate route parameters. The separate query array supports nested values and uses RFC 3986 encoding. Unknown route names, missing or extra path parameters, empty values, and duplicate route names fail immediately with a clear exception. Generated URLs are deliberately root-relative; applications that need an absolute URL should prepend their explicitly configured trusted origin.
 
-Unknown paths return `404 Not Found`. A known path requested with an unsupported HTTP method returns `405 Method Not Allowed` with an `Allow` header.
+Unknown paths return `404 Not Found`. A known path requested with an unsupported HTTP method returns `405 Method Not Allowed` with a stable, de-duplicated `Allow` header. GET always adds HEAD, and HEAD responses have their body removed. OPTIONS is explicit: register an `options()` route when an endpoint handles it; otherwise a matching path returns 405 and advertises its registered methods.
+
+Controller array handlers and invokable class strings must resolve to public callables. The first parameter must be typed exactly as `Request` to receive request injection. Decoded route parameters may target untyped, `string`, or `mixed` handler parameters; scalar coercion, union/intersection guessing, and by-reference request or route arguments are rejected with `RouteHandlerException` context.
 
 `Meulah\Http\Response` is the default implementation of `ResponseInterface`. Routing, middleware, request handlers, and the application kernel depend on the interface, so applications may return another compatible response implementation when needed.
 
@@ -590,9 +596,13 @@ final class SendWelcomeEmail
 }
 ~~~
 
-Dispatch is synchronous and listeners run in registration order. A listener may require at most the event argument; incompatible listener signatures are rejected during registration. Listener return values are ignored, `dispatch()` returns the same event object, and an exception immediately stops dispatch and propagates to the caller.
+Dispatch is synchronous and listeners run in registration order. Registering the same closure, callable, or listener class more than once is deliberate: each registration produces one invocation. A listener may require at most the event argument, cannot receive it by reference, and its declared type must accept the registered event class. Incompatible signatures are rejected during registration.
 
-Matching is intentionally exact: listeners registered for another class or parent type are not discovered. This version has no queues, event discovery, wildcard listeners, subscribers, realtime broadcasting, annotations, or attributes.
+Listener return values are ignored, event mutation is visible to later listeners, and `dispatch()` returns the same event object. An exception immediately stops dispatch and propagates unchanged. Nested dispatch of another event is supported; recursively dispatching the same event object throws `EventDispatchException`, and the in-progress marker is always cleared so a long-running dispatcher retains no per-dispatch state.
+
+Registration matching is intentionally exact: dispatching a child class does not discover listeners registered for its parent or interfaces. A listener registered directly for that child may still type its parameter as a compatible parent, interface, `object`, or `mixed`. This version has no queues, event discovery, wildcard listeners, subscribers, priorities, realtime broadcasting, annotations, or attributes.
+
+Treat listener registration as application-lifetime configuration. In a long-running worker, do not add request-specific closures to the shared dispatcher; registered listeners intentionally remain until the dispatcher itself is discarded.
 
 ## Configuration
 
@@ -665,7 +675,9 @@ php meulah migrate:fresh
 
 The starter's root `meulah` launcher passes its application root directly to the single framework CLI implementation. The framework also exposes `vendor/bin/meulah`; that entry point honors `MEULAH_APPLICATION_ROOT`, searches upward from the current directory, and then checks its Composer installation relationship. Discovery accepts only projects with the starter's explicit `extra.meulah.application` marker and expected bootstrap, configuration, and route structure.
 
-Console features are individual objects implementing `Meulah\Console\Command`. `ConsoleApplication` owns only registration and dispatch, while the launcher composes the built-in migration commands for an application root. `Input` exposes positional arguments and long options, rejects duplicate option names, and does not coerce option values. `Output` separates ordinary and error output and reports stream write failures explicitly. Applications can add custom commands without modifying the dispatcher:
+Console features are individual objects implementing `Meulah\Console\Command`. `ConsoleApplication` owns only registration and dispatch, while the launcher composes the built-in migration commands for an application root. Command names and aliases are unique, help output is sorted by command name, and equally close unknown-command suggestions are sorted by name.
+
+`Input` preserves positional arguments and parses long options without coercion. Values use `--option=value`; `--option value` is not supported, and a bare `--option` is the boolean flag `true`. Empty values remain distinct from missing options. Duplicate options are rejected. Built-in commands reject unknown options, surplus positional arguments, valued flags, and options combined with command help. Custom commands should call `assertOnlyOptions()`, `assertArgumentCount()`, and `assertFlag()` before side effects. `Output` is the only output path used by commands, separates stdout from stderr, and reports stream failures explicitly. Applications can add custom commands without modifying the dispatcher:
 
 ```php
 use Meulah\Console\Application;
@@ -676,13 +688,13 @@ $console->add(new ReportCommand());
 exit($console->run($argv));
 ```
 
-An unknown command returns a non-zero status and suggests close registered names. Command execution is non-interactive; options must be supplied explicitly.
+Unknown commands, invalid input, and thrown command exceptions write to stderr and return status `1`; command return codes otherwise pass through unchanged. Command execution is non-interactive and never prompts in CI.
 
 `migrate` runs only files not recorded in the migration history table. All migrations from one invocation share a batch number, and `migrate:rollback` reverses the most recent batch in reverse filename order. `migrate:reset` rolls back every recorded batch. `migrate:fresh` drops every table—including tables not managed by migrations—and then reruns all migrations. A recorded migration whose file has been removed appears as `Missing` in the status output.
 
-Use `--path=some/directory` to override the configured directory; bare `--path` and `--path=` are invalid, while Unix `/` and Windows drive roots are preserved exactly. `DB_MIGRATIONS` and `DB_MIGRATION_TABLE` configure the defaults. Migration SQL remains intentionally explicit, so applications that support multiple database engines should use SQL compatible with each selected engine.
+Use `--path=some/directory` to override the configured directory; `--path some/directory`, bare `--path`, and `--path=` are invalid, while Unix `/` and Windows drive roots are preserved exactly. `DB_MIGRATIONS` and `DB_MIGRATION_TABLE` configure the defaults. Migration SQL remains intentionally explicit, so applications that support multiple database engines should use SQL compatible with each selected engine.
 
-Rollback, reset, and fresh commands require `--force` when `APP_ENV=production`:
+Rollback, reset, and fresh commands require a bare `--force` when `APP_ENV=production`; `--force=` and `--force=false` are rejected in every environment:
 
 ```bash
 php meulah migrate:fresh --force

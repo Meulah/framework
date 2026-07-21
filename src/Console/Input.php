@@ -87,4 +87,62 @@ final class Input
     {
         return $this->options[$name] ?? $default;
     }
+
+    /** @param list<string> $allowed */
+    public function assertOnlyOptions(array $allowed): void
+    {
+        foreach (array_keys($this->options) as $name) {
+            if (!in_array($name, $allowed, true)) {
+                throw new ConsoleInputException(sprintf(
+                    "Unknown option '--%s' for command '%s'.",
+                    $name,
+                    $this->command,
+                ));
+            }
+        }
+    }
+
+    public function assertArgumentCount(int $minimum, int $maximum): void
+    {
+        if ($minimum < 0 || $maximum < $minimum) {
+            throw new \InvalidArgumentException('Argument count boundaries are invalid.');
+        }
+
+        $count = count($this->arguments);
+
+        if ($count >= $minimum && $count <= $maximum) {
+            return;
+        }
+
+        $expected = match (true) {
+            $maximum === 0 => 'no arguments',
+            $minimum === $maximum => sprintf(
+                'exactly %d argument%s',
+                $minimum,
+                $minimum === 1 ? '' : 's',
+            ),
+            default => sprintf('%d to %d arguments', $minimum, $maximum),
+        };
+
+        throw new ConsoleInputException(sprintf(
+            "Command '%s' expects %s; %d given.",
+            $this->command,
+            $expected,
+            $count,
+        ));
+    }
+
+    public function assertFlag(string $name): void
+    {
+        if (!$this->hasOption($name)) {
+            return;
+        }
+
+        if ($this->option($name) !== true) {
+            throw new ConsoleInputException(sprintf(
+                "Option '--%s' is a flag and does not accept a value.",
+                $name,
+            ));
+        }
+    }
 }

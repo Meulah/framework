@@ -33,6 +33,9 @@ final class MakeMigrationCommand implements Command
 
     public function execute(Input $input, Output $output): int
     {
+        $input->assertOnlyOptions(['path']);
+        $input->assertArgumentCount(1, 1);
+
         $name = strtolower(trim((string) preg_replace(
             '/[^A-Za-z0-9]+/',
             '_',

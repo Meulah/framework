@@ -32,6 +32,8 @@ final class MigrationRollbackCommand implements Command
 
     public function execute(Input $input, Output $output): int
     {
+        $input->assertOnlyOptions(['path', 'force']);
+        $input->assertArgumentCount(0, 0);
         $this->context->assertDestructiveCommandAllowed($input);
         [$migrator, $migrations] = $this->context->migrator($input);
         $rolledBack = $migrator->rollbackLast($migrations);

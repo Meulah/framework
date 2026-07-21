@@ -38,25 +38,7 @@ final class Route
             ));
         }
 
-        if ($pattern === '') {
-            throw new RouteDefinitionException('A route parameter constraint cannot be empty.');
-        }
-
-        if (preg_match("/\\(\\?(?:P?<|<[A-Za-z_]|'[A-Za-z_])/", $pattern) === 1) {
-            throw new RouteDefinitionException(sprintf(
-                "The constraint for route parameter '%s' cannot contain a named capture.",
-                $parameter,
-            ));
-        }
-
-        $escapedPattern = str_replace('#', '\\#', $pattern);
-
-        if (@preg_match('#^(?:' . $escapedPattern . ')$#', '') === false) {
-            throw new RouteDefinitionException(sprintf(
-                "The constraint for route parameter '%s' is not a valid regular expression.",
-                $parameter,
-            ));
-        }
+        RouteConstraint::validate($parameter, $pattern);
 
         $this->constraints[$parameter] = $pattern;
         return $this;

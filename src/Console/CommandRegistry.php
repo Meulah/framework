@@ -98,7 +98,11 @@ final class CommandRegistry
             }
         }
 
-        asort($matches);
+        uksort($matches, static function (string $left, string $right) use ($matches): int {
+            $distance = $matches[$left] <=> $matches[$right];
+
+            return $distance === 0 ? strcmp($left, $right) : $distance;
+        });
 
         return array_slice(array_keys($matches), 0, 3);
     }

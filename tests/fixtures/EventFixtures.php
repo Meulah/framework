@@ -28,3 +28,16 @@ final class SendWelcomeEmail
         $this->log->entries[] = 'welcome:' . $event->user;
     }
 }
+
+class ParentEvent
+{
+}
+
+final class ChildEvent extends ParentEvent
+{
+}
+
+final class MutableEvent
+{
+    public string $value = 'initial';
+}

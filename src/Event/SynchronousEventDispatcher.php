@@ -9,6 +9,11 @@ use InvalidArgumentException;
 use Meulah\Container\Container;
 use ReflectionClass;
 use ReflectionFunction;
+use ReflectionIntersectionType;
+use ReflectionNamedType;
+use ReflectionType;
+use ReflectionUnionType;
+use SplObjectStorage;
 
 final class SynchronousEventDispatcher implements EventDispatcher
 {
@@ -16,10 +21,13 @@ final class SynchronousEventDispatcher implements EventDispatcher
     private array $listeners = [];
 
     private readonly Container $container;
+    /** @var SplObjectStorage<object, null> */
+    private readonly SplObjectStorage $dispatching;
 
     public function __construct(?Container $container = null)
     {
         $this->container = $container ?? new Container();
+        $this->dispatching = new SplObjectStorage();
     }
 
     public function listen(string $event, callable|string $listener): void
@@ -59,23 +67,35 @@ final class SynchronousEventDispatcher implements EventDispatcher
                 ));
             }
         }
-        $this->assertListenerSignature($listener);
+        $this->assertListenerSignature($event, $listener);
 
         $this->listeners[$event][] = $listener;
     }
 
     public function dispatch(object $event): object
     {
-        $listeners = $this->listeners[$event::class] ?? [];
+        if ($this->dispatching->contains($event)) {
+            throw new EventDispatchException(sprintf(
+                "Circular dispatch detected for event object '%s'.",
+                $event::class,
+            ));
+        }
 
-        foreach ($listeners as $listener) {
-            $this->resolve($listener)($event);
+        $listeners = $this->listeners[$event::class] ?? [];
+        $this->dispatching->attach($event);
+
+        try {
+            foreach ($listeners as $listener) {
+                $this->resolve($listener)($event);
+            }
+        } finally {
+            $this->dispatching->detach($event);
         }
 
         return $event;
     }
 
-    private function assertListenerSignature(callable|string $listener): void
+    private function assertListenerSignature(string $event, callable|string $listener): void
     {
         $reflection = is_string($listener) && class_exists($listener)
             ? (new ReflectionClass($listener))->getMethod('__invoke')
@@ -87,6 +107,64 @@ final class SynchronousEventDispatcher implements EventDispatcher
                 is_string($listener) ? $listener : $reflection->getName(),
             ));
         }
+
+        $parameter = $reflection->getParameters()[0] ?? null;
+
+        if ($parameter === null) {
+            return;
+        }
+
+        if ($parameter->isPassedByReference()) {
+            throw new InvalidArgumentException(sprintf(
+                "Event listener '%s' cannot receive its event by reference.",
+                is_string($listener) ? $listener : $reflection->getName(),
+            ));
+        }
+
+        $type = $parameter->getType();
+
+        if ($type !== null && !$this->typeAcceptsEvent($type, $event)) {
+            throw new InvalidArgumentException(sprintf(
+                "Event listener '%s' parameter '$%s' typed %s cannot receive event '%s'.",
+                is_string($listener) ? $listener : $reflection->getName(),
+                $parameter->getName(),
+                (string) $type,
+                $event,
+            ));
+        }
+    }
+
+    private function typeAcceptsEvent(ReflectionType $type, string $event): bool
+    {
+        if ($type instanceof ReflectionNamedType) {
+            if ($type->isBuiltin()) {
+                return in_array($type->getName(), ['mixed', 'object'], true);
+            }
+
+            return is_a($event, $type->getName(), true);
+        }
+
+        if ($type instanceof ReflectionUnionType) {
+            foreach ($type->getTypes() as $member) {
+                if ($this->typeAcceptsEvent($member, $event)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        if ($type instanceof ReflectionIntersectionType) {
+            foreach ($type->getTypes() as $member) {
+                if (!$this->typeAcceptsEvent($member, $event)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return false;
     }
 
     private function resolve(callable|string $listener): callable

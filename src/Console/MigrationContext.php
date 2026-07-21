@@ -61,6 +61,12 @@ final class MigrationContext
 
     public function assertDestructiveCommandAllowed(Input $input): void
     {
+        if ($input->hasOption('force') && $input->option('force') !== true) {
+            throw new ConsoleInputException(
+                'Destructive migration commands require --force as a bare flag.',
+            );
+        }
+
         if (
             $this->kernel()->config()->string('app.environment') === 'production'
             && $input->option('force') !== true
