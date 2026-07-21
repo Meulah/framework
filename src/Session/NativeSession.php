@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Meulah\Session;
 
 use InvalidArgumentException;
+use Meulah\Http\Cookie;
 use Meulah\Http\SameSite;
 use WeakReference;
 
@@ -25,13 +26,22 @@ final class NativeSession implements Session
         SameSite|string $sameSite = SameSite::Lax,
         private readonly string $path = '/',
         private readonly int $lifetime = 0,
+        private readonly ?string $domain = null,
     ) {
         if (preg_match('/^[A-Za-z][A-Za-z0-9]*$/', $this->name) !== 1) {
             throw new InvalidArgumentException('Native session names must contain only letters and numbers and start with a letter.');
         }
 
-        if ($this->path === '' || preg_match('/[\x00-\x1F\x7F;]/', $this->path) === 1) {
+        if (
+            $this->path === ''
+            || !str_starts_with($this->path, '/')
+            || preg_match('/[\x00-\x20\x7F-\xFF;]/', $this->path) === 1
+        ) {
             throw new InvalidArgumentException('Invalid native session cookie path.');
+        }
+
+        if ($this->domain !== null) {
+            $this->assertDomain($this->domain);
         }
 
         if ($this->lifetime < 0) {
@@ -53,6 +63,13 @@ final class NativeSession implements Session
     public function start(): void
     {
         if ($this->started && session_status() === PHP_SESSION_ACTIVE) {
+            if (self::$activeOwner?->get() !== $this) {
+                throw new SessionException(
+                    "Native session '{$this->name}' is no longer owned by this NativeSession instance.",
+                );
+            }
+
+            $this->assertActiveConfiguration();
             return;
         }
 
@@ -67,7 +84,14 @@ final class NativeSession implements Session
 
             $owner = self::$activeOwner?->get();
 
-            if ($owner instanceof self && $owner !== $this) {
+            if (!$owner instanceof self) {
+                throw new SessionException(sprintf(
+                    "Active native session '%s' is not managed by a NativeSession instance.",
+                    $this->name,
+                ));
+            }
+
+            if ($owner !== $this) {
                 throw new SessionException(sprintf(
                     "Native session '%s' is already managed by another NativeSession instance.",
                     $this->name,
@@ -81,25 +105,48 @@ final class NativeSession implements Session
             return;
         }
 
-        if (headers_sent($file, $line)) {
-            throw new SessionException("Cannot start a session after output was sent at {$file}:{$line}.");
-        }
+        $this->assertHeadersAvailable('start');
 
         if (session_name($this->name) === false) {
             throw new SessionException("Unable to set native session name '{$this->name}'.");
         }
 
-        error_clear_last();
-        $started = @session_start([
-            'use_strict_mode' => 1,
-            'use_only_cookies' => 1,
-            'use_trans_sid' => 0,
-            'cookie_lifetime' => $this->lifetime,
-            'cookie_path' => $this->path,
-            'cookie_secure' => $this->secure ? 1 : 0,
-            'cookie_httponly' => $this->httpOnly ? 1 : 0,
-            'cookie_samesite' => $this->sameSite->value,
-        ]);
+        $cookiePresent = array_key_exists($this->name, $_COOKIE);
+        $cookieValue = $cookiePresent ? $_COOKIE[$this->name] : null;
+        $currentId = $cookiePresent ? $cookieValue : session_id();
+        $restoreCookie = false;
+
+        if (!is_string($currentId) || ($currentId !== '' && preg_match('/^[A-Za-z0-9,-]{1,256}$/', $currentId) !== 1)) {
+            if ($cookiePresent) {
+                unset($_COOKIE[$this->name]);
+                $restoreCookie = true;
+            }
+
+            if (session_id('') === false) {
+                throw new SessionException('Unable to discard an invalid native session identifier.');
+            }
+        } elseif ($currentId !== session_id() && session_id($currentId) === false) {
+            throw new SessionException('Unable to select the incoming native session identifier.');
+        }
+
+        try {
+            $started = @session_start([
+                'use_cookies' => 1,
+                'use_strict_mode' => 1,
+                'use_only_cookies' => 1,
+                'use_trans_sid' => 0,
+                'cookie_lifetime' => $this->lifetime,
+                'cookie_domain' => $this->domain ?? '',
+                'cookie_path' => $this->path,
+                'cookie_secure' => $this->secure ? 1 : 0,
+                'cookie_httponly' => $this->httpOnly ? 1 : 0,
+                'cookie_samesite' => $this->sameSite->value,
+            ]);
+        } finally {
+            if ($restoreCookie) {
+                $_COOKIE[$this->name] = $cookieValue;
+            }
+        }
 
         if (!$started || session_status() !== PHP_SESSION_ACTIVE) {
             throw $this->nativeFailure('Unable to start the native PHP session.');
@@ -138,7 +185,7 @@ final class NativeSession implements Session
     {
         $this->start();
 
-        error_clear_last();
+        $this->assertHeadersAvailable('regenerate');
         if (!@session_regenerate_id(true)) {
             throw $this->nativeFailure('Unable to regenerate the native session identifier.');
         }
@@ -147,12 +194,23 @@ final class NativeSession implements Session
     public function invalidate(): void
     {
         $this->start();
+        $this->assertHeadersAvailable('invalidate');
         $_SESSION = [];
 
-        error_clear_last();
         if (!@session_regenerate_id(true)) {
             throw $this->nativeFailure('Unable to invalidate the native session.');
+
         }
+        header('Set-Cookie: ' . Cookie::forget(
+            name: $this->name,
+            path: $this->path,
+            secure: $this->secure,
+            httpOnly: $this->httpOnly,
+            sameSite: $this->sameSite,
+            domain: $this->domain,
+        )->toHeader(), false);
+
+        $this->flashAged = true;
     }
 
     public function flash(string $key, mixed $value): void
@@ -170,6 +228,37 @@ final class NativeSession implements Session
         $_SESSION[self::FLASH_KEY] = $metadata;
     }
 
+    public function keep(string ...$keys): void
+    {
+        $this->start();
+        $metadata = $this->flashMetadata();
+
+        foreach ($keys as $key) {
+            $this->assertKey($key);
+
+            if (!in_array($key, $metadata['old'], true)) {
+                continue;
+            }
+
+            $metadata['old'] = array_values(array_diff($metadata['old'], [$key]));
+
+            if (!in_array($key, $metadata['new'], true)) {
+                $metadata['new'][] = $key;
+            }
+        }
+
+        $_SESSION[self::FLASH_KEY] = $metadata;
+    }
+
+    public function reflash(): void
+    {
+        $this->start();
+        $metadata = $this->flashMetadata();
+        $metadata['new'] = array_values(array_unique([...$metadata['new'], ...$metadata['old']]));
+        $metadata['old'] = [];
+        $_SESSION[self::FLASH_KEY] = $metadata;
+    }
+
     public function id(): string
     {
         $this->start();
@@ -184,9 +273,19 @@ final class NativeSession implements Session
     public function close(): void
     {
         if ($this->started && session_status() === PHP_SESSION_ACTIVE) {
-            session_write_close();
+            if (!@session_write_close()) {
+                throw $this->nativeFailure('Unable to close the native PHP session.');
+            }
         }
 
+        if ($this->started) {
+            $_SESSION = [];
+
+            if (@session_id('') === false) {
+                throw $this->nativeFailure('Unable to clear the native session identifier.');
+            }
+
+        }
         $owner = self::$activeOwner?->get();
         if ($owner === $this) {
             self::$activeOwner = null;
@@ -204,9 +303,14 @@ final class NativeSession implements Session
         if (
             (int) $parameters['lifetime'] === $this->lifetime
             && (string) $parameters['path'] === $this->path
+            && (string) $parameters['domain'] === ($this->domain ?? '')
             && (bool) $parameters['secure'] === $this->secure
             && (bool) $parameters['httponly'] === $this->httpOnly
             && strcasecmp($sameSite, $this->sameSite->value) === 0
+            && (bool) ini_get('session.use_strict_mode')
+            && (bool) ini_get('session.use_cookies')
+            && (bool) ini_get('session.use_only_cookies')
+            && !(bool) ini_get('session.use_trans_sid')
         ) {
             return;
         }
@@ -219,14 +323,7 @@ final class NativeSession implements Session
 
     private function nativeFailure(string $message): SessionException
     {
-        $error = error_get_last();
-        $detail = is_array($error) && is_string($error['message'] ?? null)
-            ? trim($error['message'])
-            : '';
-
-        return new SessionException($detail === ''
-            ? $message
-            : $message . ' Native PHP reported: ' . $detail);
+        return new SessionException($message);
     }
 
     private function assertKey(string $key): void
@@ -290,5 +387,33 @@ final class NativeSession implements Session
         $metadata['old'] = array_values(array_diff($metadata['old'], [$key]));
         $metadata['new'] = array_values(array_diff($metadata['new'], [$key]));
         $_SESSION[self::FLASH_KEY] = $metadata;
+    }
+
+    private function assertHeadersAvailable(string $operation): void
+    {
+        if (headers_sent()) {
+            throw new SessionException("Cannot {$operation} the native PHP session after response output has started.");
+        }
+    }
+
+    private function assertDomain(string $domain): void
+    {
+        if (
+            $domain === ''
+            || strlen($domain) > 253
+            || preg_match('/[\x00-\x20\x7F;,\x80-\xFF]/', $domain) === 1
+        ) {
+            throw new InvalidArgumentException('Invalid native session cookie domain.');
+        }
+
+        foreach (explode('.', $domain) as $label) {
+            if (
+                $label === ''
+                || strlen($label) > 63
+                || preg_match('/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/', $label) !== 1
+            ) {
+                throw new InvalidArgumentException('Invalid native session cookie domain.');
+            }
+        }
     }
 }

@@ -49,6 +49,7 @@ use Meulah\Security\Csrf\VerifyCsrfToken;
 use Meulah\Session\NativeSession;
 use Meulah\Session\Session;
 use Meulah\Session\SessionException;
+use Meulah\Session\SessionMiddleware;
 use Meulah\Support\Environment;
 use Meulah\Validation\ValidationException;
 use Meulah\Validation\ValidationRuleException;
@@ -89,34 +90,53 @@ $sessionFactory = static function (): Session {
         /** @var array<string, mixed> */
         public array $data = [];
         private string $identifier = 'test-session-one';
+        public bool $started = false;
+        public int $closeCount = 0;
+
+        public function start(): void
+        {
+            $this->started = true;
+        }
+
+        public function isStarted(): bool
+        {
+            return $this->started;
+        }
+
 
         public function id(): string
         {
+            $this->start();
             return $this->identifier;
         }
 
         public function get(string $key, mixed $default = null): mixed
         {
+            $this->start();
             return array_key_exists($key, $this->data) ? $this->data[$key] : $default;
         }
 
         public function put(string $key, mixed $value): void
         {
+            $this->start();
             $this->data[$key] = $value;
         }
 
         public function remove(string $key): void
         {
+            $this->start();
             unset($this->data[$key]);
         }
 
         public function regenerate(): void
         {
+            $this->start();
             $this->identifier = 'test-session-' . bin2hex(random_bytes(8));
         }
 
         public function invalidate(): void
         {
+            $this->start();
             $this->data = [];
             $this->regenerate();
         }
@@ -125,6 +145,22 @@ $sessionFactory = static function (): Session {
         {
             $this->put($key, $value);
         }
+
+        public function keep(string ...$keys): void
+        {
+            $this->start();
+        }
+
+        public function reflash(): void
+        {
+            $this->start();
+        }
+
+        public function close(): void
+        {
+            $this->started = false;
+            $this->closeCount++;
+        }
     };
 };
 
@@ -132,12 +168,17 @@ $test('native sessions store regenerate invalidate and age flash data', static f
     $originalSavePath = session_save_path();
     $originalName = session_name();
     $originalCookieParameters = session_get_cookie_params();
+    $cookieName = 'MEULAHTESTSESSION';
+    $hadOriginalCookie = array_key_exists($cookieName, $_COOKIE);
+    $originalCookieValue = $hadOriginalCookie ? $_COOKIE[$cookieName] : null;
     $iniKeys = [
         'session.use_strict_mode',
+        'session.use_cookies',
         'session.use_only_cookies',
         'session.use_trans_sid',
         'session.cookie_lifetime',
         'session.cookie_path',
+        'session.cookie_domain',
         'session.cookie_secure',
         'session.cookie_httponly',
         'session.cookie_samesite',
@@ -159,12 +200,34 @@ $test('native sessions store regenerate invalidate and age flash data', static f
             session_write_close();
         }
 
-        session_id('');
         session_save_path($directory);
-        $session = new NativeSession(name: 'MEULAHTESTSESSION', secure: false);
 
+        session_id('');
+        $_COOKIE[$cookieName] = 'invalid!identifier';
+        $invalidIdSession = new NativeSession(name: 'MEULAHTESTSESSION', secure: false);
+        $invalidIdSession->start();
+        $assertSame(false, hash_equals('invalid!identifier', $invalidIdSession->id()));
+        $invalidIdSession->close();
+        $assertSame('', session_id());
+
+        session_id('');
+        $_COOKIE[$cookieName] = 'attackercontrolledid123';
+        $session = new NativeSession(name: 'MEULAHTESTSESSION', secure: false);
+        $session->start();
+        $assertSame(false, hash_equals('attackercontrolledid123', $session->id()));
+        $firstId = $session->id();
+        $session->start();
+
+        $assertSame($firstId, $session->id());
         $assertSame(true, $session instanceof Session);
-        $assertSame(false, $session->isStarted());
+        $assertSame(true, $session->isStarted());
+        $assertSame(true, (bool) ini_get('session.use_strict_mode'));
+        $assertSame(true, (bool) ini_get('session.use_cookies'));
+        $assertSame(true, (bool) ini_get('session.use_only_cookies'));
+        $assertSame(false, (bool) ini_get('session.use_trans_sid'));
+        $assertSame(false, (bool) session_get_cookie_params()['secure']);
+        $assertSame(true, (bool) session_get_cookie_params()['httponly']);
+        $assertSame('Lax', session_get_cookie_params()['samesite']);
         $session->put('user_id', 42);
         $session->put('nullable', null);
         $assertSame(42, $session->get('user_id'));
@@ -186,20 +249,61 @@ $test('native sessions store regenerate invalidate and age flash data', static f
         $assertSame(false, hash_equals($oldId, $session->id()));
         $assertSame(false, hash_equals($oldToken, $csrf->token()));
         $session->flash('notice', 'Saved');
+        $session->flash('kept', 'Keep me');
+        $session->flash('reflashed', 'Reflash me');
+        $session->flash('overwritten', 'first');
+        $session->flash('overwritten', 'second');
+        $session->regenerate();
+        $assertSame(42, $session->get('user_id'));
+        $nextSessionId = $session->id();
         $session->close();
+        $assertSame('', session_id());
+        $_COOKIE[$cookieName] = $nextSessionId;
 
-        $nextRequest = new NativeSession(name: 'MEULAHTESTSESSION', secure: false);
+        $nextRequest = $session;
+        $assertSame(false, $nextRequest->isStarted());
         $assertSame('Saved', $nextRequest->get('notice'));
+        $assertSame('Keep me', $nextRequest->get('kept'));
+        $assertSame('Reflash me', $nextRequest->get('reflashed'));
+        $assertSame('second', $nextRequest->get('overwritten'));
         $assertSame(42, $nextRequest->get('user_id'));
+        $nextRequest->put('notice', 'normal value');
+        $nextRequest->keep('kept');
+        $nextRequest->keep('missing');
+        $nextRequest->reflash();
+        $nextRequest->remove('overwritten');
+        $followingSessionId = $nextRequest->id();
         $nextRequest->close();
+        $assertSame('', session_id());
+        $_COOKIE[$cookieName] = $followingSessionId;
 
         $followingRequest = new NativeSession(name: 'MEULAHTESTSESSION', secure: false);
-        $assertSame('missing', $followingRequest->get('notice', 'missing'));
-        $idBeforeInvalidation = $followingRequest->id();
-        $followingRequest->invalidate();
-        $assertSame(false, hash_equals($idBeforeInvalidation, $followingRequest->id()));
-        $assertSame('missing', $followingRequest->get('user_id', 'missing'));
+        $assertSame('normal value', $followingRequest->get('notice'));
+        $assertSame('Keep me', $followingRequest->get('kept'));
+        $assertSame('Reflash me', $followingRequest->get('reflashed'));
+        $assertSame('missing', $followingRequest->get('overwritten', 'missing'));
+        $finalSessionId = $followingRequest->id();
         $followingRequest->close();
+        $assertSame('', session_id());
+        $_COOKIE[$cookieName] = $finalSessionId;
+
+        $finalRequest = new NativeSession(name: 'MEULAHTESTSESSION', secure: false);
+        $assertSame('normal value', $finalRequest->get('notice'));
+        $assertSame('missing', $finalRequest->get('kept', 'missing'));
+        $assertSame('missing', $finalRequest->get('reflashed', 'missing'));
+        $finalRequest->flash('clear_on_invalidate', 'value');
+        $idBeforeInvalidation = $finalRequest->id();
+        $finalRequest->invalidate();
+        $assertSame(false, hash_equals($idBeforeInvalidation, $finalRequest->id()));
+        $assertSame('missing', $finalRequest->get('user_id', 'missing'));
+        $assertSame('missing', $finalRequest->get('notice', 'missing'));
+        $assertSame('missing', $finalRequest->get('clear_on_invalidate', 'missing'));
+        $secondInvalidationId = $finalRequest->id();
+        $finalRequest->invalidate();
+        $assertSame(false, hash_equals($secondInvalidationId, $finalRequest->id()));
+        $finalRequest->close();
+        $assertSame('', session_id());
+
     } finally {
         if (session_status() === PHP_SESSION_ACTIVE) {
             $_SESSION = [];
@@ -210,6 +314,12 @@ $test('native sessions store regenerate invalidate and age flash data', static f
         session_name($originalName);
         session_save_path($originalSavePath);
         session_set_cookie_params($originalCookieParameters);
+
+        if ($hadOriginalCookie) {
+            $_COOKIE[$cookieName] = $originalCookieValue;
+        } else {
+            unset($_COOKIE[$cookieName]);
+        }
 
         foreach ($originalIni as $key => $value) {
             if (is_string($value)) {
@@ -229,6 +339,69 @@ $test('native sessions store regenerate invalidate and age flash data', static f
     }
 });
 
+
+$test('session middleware preserves lazy start and closes active sessions', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $middleware = new SessionMiddleware($session);
+    $response = $middleware->process(
+        new Request('GET', '/'),
+        new class implements RequestHandler {
+            public function handle(Request $request): ResponseInterface
+            {
+                return Response::html('lazy');
+            }
+        },
+    );
+
+    $assertSame('lazy', $response->content());
+    $assertSame(false, $session->isStarted());
+    $assertSame(1, $session->closeCount);
+
+    $active = $sessionFactory();
+    $activeMiddleware = new SessionMiddleware($active);
+    $response = $activeMiddleware->process(
+        new Request('GET', '/write'),
+        new class($active) implements RequestHandler {
+            public function __construct(private readonly Session $session)
+            {
+            }
+
+            public function handle(Request $request): ResponseInterface
+            {
+                $this->session->put('value', 'stored');
+                return Response::html('active');
+            }
+        },
+    );
+
+    $assertSame('active', $response->content());
+    $assertSame('stored', $active->data['value']);
+    $assertSame(false, $active->isStarted());
+    $assertSame(1, $active->closeCount);
+});
+
+$test('session middleware closes sessions when downstream handling fails', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $middleware = new SessionMiddleware($session);
+
+    try {
+        $middleware->process(
+            new Request('GET', '/fail'),
+            new class implements RequestHandler {
+                public function handle(Request $request): ResponseInterface
+                {
+                    throw new RuntimeException('downstream failed');
+                }
+            },
+        );
+        throw new RuntimeException('Expected downstream failure.');
+    } catch (RuntimeException $exception) {
+        $assertSame('downstream failed', $exception->getMessage());
+    }
+
+    $assertSame(1, $session->closeCount);
+    $assertSame(false, $session->isStarted());
+});
 $test('CSRF validation does not create session state for missing tokens', static function () use ($assertSame, $sessionFactory): void {
     $session = $sessionFactory();
     $csrf = new Csrf($session);
@@ -2136,12 +2309,14 @@ $test('middleware exceptions use the configured exception handler', static funct
 $test('cookies serialize secure attributes and responses preserve repeated cookies', static function () use ($assertSame): void {
     $cookie = Cookie::make(
         name: 'theme',
-        value: 'dark mode',
+        value: 'dark mode/' . "\u{00FC}" . ';=',
         expires: new DateTimeImmutable('2030-01-02 03:04:05+00:00'),
-        path: '/',
+        path: '/preferences',
         secure: true,
         httpOnly: true,
         sameSite: SameSite::Lax,
+        domain: 'example.com',
+        maxAge: 3600,
     );
     $language = Cookie::make(
         name: 'language',
@@ -2150,26 +2325,82 @@ $test('cookies serialize secure attributes and responses preserve repeated cooki
         httpOnly: false,
         sameSite: SameSite::Strict,
     );
-    $original = Response::html('Saved');
+    $original = new Response('Saved', headers: ['Set-Cookie' => 'legacy=value; Path=/']);
     $response = $original->withCookie($cookie)->withCookie($language);
     $header = $cookie->toHeader();
 
     $assertSame([], $original->cookies());
     $assertSame([$cookie, $language], $response->cookies());
     $assertSame([$cookie, $language], $response->withoutBody()->cookies());
-    $assertSame(true, str_starts_with($header, 'theme=dark%20mode; '));
+    $assertSame(true, str_starts_with($header, 'theme=dark%20mode%2F%C3%BC%3B%3D; '));
     $assertSame(true, str_contains($header, 'Expires=Wed, 02 Jan 2030 03:04:05 GMT'));
-    $assertSame(true, str_contains($header, 'Path=/'));
+    $assertSame(true, str_contains($header, 'Max-Age=3600'));
+    $assertSame(true, str_contains($header, 'Path=/preferences'));
+    $assertSame(true, str_contains($header, 'Domain=example.com'));
     $assertSame(true, str_contains($header, 'Secure'));
     $assertSame(true, str_contains($header, 'HttpOnly'));
     $assertSame(true, str_contains($header, 'SameSite=Lax'));
+    $assertSame('legacy=value; Path=/', $response->headers()['Set-Cookie']);
+    $assertSame(false, str_contains($language->toHeader(), 'Secure'));
+    $assertSame(false, str_contains($language->toHeader(), 'HttpOnly'));
+});
+
+$test('cookies support SameSite None deletion and duplicate names with distinct paths', static function () use ($assertSame): void {
+    $none = Cookie::make(
+        name: 'cross_site',
+        value: 'allowed',
+        secure: true,
+        httpOnly: true,
+        sameSite: SameSite::None,
+    );
+    $root = Cookie::make(
+        name: 'theme',
+        value: 'root',
+        path: '/',
+    );
+    $admin = Cookie::make(
+        name: 'theme',
+        value: 'admin',
+        path: '/admin',
+    );
+    $deletion = Cookie::forget(
+        name: 'session',
+        path: '/account',
+        secure: true,
+        httpOnly: true,
+        sameSite: SameSite::Strict,
+        domain: 'example.com',
+    );
+    $response = Response::html('cookies')
+        ->withCookie($root)
+        ->withCookie($admin)
+        ->withCookie($none)
+        ->withCookie($deletion);
+
+    $assertSame([$root, $admin, $none, $deletion], $response->cookies());
+    $noneHeader = $none->toHeader();
+    $assertSame(true, str_contains($noneHeader, 'Secure'));
+    $assertSame(true, str_contains($noneHeader, 'SameSite=None'));
+    $deletionHeader = $deletion->toHeader();
+    $assertSame(true, str_starts_with($deletionHeader, 'session=; '));
+    $assertSame(true, str_contains($deletionHeader, 'Expires=Thu, 01 Jan 1970 00:00:00 GMT'));
+    $assertSame(true, str_contains($deletionHeader, 'Max-Age=0'));
+    $assertSame(true, str_contains($deletionHeader, 'Path=/account'));
+    $assertSame(true, str_contains($deletionHeader, 'Domain=example.com'));
+    $assertSame(true, str_contains($deletionHeader, 'SameSite=Strict'));
 });
 
 $test('cookies reject unsafe names values attributes and expiration', static function (): void {
     $invalidCookies = [
         static fn (): Cookie => Cookie::make(name: 'bad name', value: 'value'),
         static fn (): Cookie => Cookie::make(name: 'theme', value: "safe\r\nSet-Cookie: injected=yes"),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: "dark\0mode"),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: "dark\tmode"),
         static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', path: "/\r\n"),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', path: 'relative'),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', path: '/bad;path'),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', path: '/bad path'),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', path: "/\u{00FC}nicode"),
         static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', sameSite: 'Unsupported'),
         static fn (): Cookie => Cookie::make(
             name: 'theme',
@@ -2184,6 +2415,13 @@ $test('cookies reject unsafe names values attributes and expiration', static fun
         ),
         static fn (): Cookie => Cookie::make(name: '__Secure-id', value: 'value', secure: false),
         static fn (): Cookie => Cookie::make(name: '__Host-id', value: 'value', path: '/app', secure: true),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', domain: ''),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', domain: "example.com\r\n"),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', domain: 'example.com;Secure'),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', domain: "\u{00FC}nicode.example"),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', domain: '.example.com'),
+        static fn (): Cookie => Cookie::make(name: 'theme', value: 'dark', maxAge: -1),
+        static fn (): Cookie => Cookie::make(name: '__Host-id', value: 'value', domain: 'example.com'),
     ];
 
     foreach ($invalidCookies as $createCookie) {
@@ -2205,6 +2443,14 @@ $test('native sessions reject unsafe configuration', static function (): void {
     $invalidSessions = [
         static fn (): NativeSession => new NativeSession(name: 'bad_session_name'),
         static fn (): NativeSession => new NativeSession(path: "/\r\n"),
+        static fn (): NativeSession => new NativeSession(path: 'relative'),
+        static fn (): NativeSession => new NativeSession(path: '/bad;path'),
+        static fn (): NativeSession => new NativeSession(path: '/bad path'),
+        static fn (): NativeSession => new NativeSession(path: "/\u{00FC}nicode"),
+        static fn (): NativeSession => new NativeSession(domain: ''),
+        static fn (): NativeSession => new NativeSession(domain: "example.com\r\n"),
+        static fn (): NativeSession => new NativeSession(domain: 'example.com;Secure'),
+        static fn (): NativeSession => new NativeSession(domain: "\u{00FC}nicode.example"),
         static fn (): NativeSession => new NativeSession(lifetime: -1),
         static fn (): NativeSession => new NativeSession(sameSite: 'Unsupported'),
         static fn (): NativeSession => new NativeSession(
@@ -2220,6 +2466,38 @@ $test('native sessions reject unsafe configuration', static function (): void {
         } catch (InvalidArgumentException) {
         }
     }
+});
+
+$test('native session operations fail without leaking warnings after output starts', static function () use ($assertSame): void {
+    if (!headers_sent()) {
+        return;
+    }
+
+    $warnings = [];
+    $previous = set_error_handler(
+        static function (int $severity, string $message) use (&$warnings): bool {
+            $warnings[] = $message;
+            return true;
+        },
+    );
+
+    try {
+        try {
+            (new NativeSession(name: 'MEULAHLATESESSION', secure: false))->start();
+            throw new RuntimeException('Expected late native session rejection.');
+        } catch (SessionException $exception) {
+            $assertSame(true, str_contains($exception->getMessage(), 'after response output has started'));
+            $assertSame(false, str_contains($exception->getMessage(), 'Native PHP reported'));
+        }
+    } finally {
+        if ($previous !== null) {
+            set_error_handler($previous);
+        } else {
+            restore_error_handler();
+        }
+    }
+
+    $assertSame([], $warnings);
 });
 
 $test('responses reject invalid status codes and headers early', static function (): void {

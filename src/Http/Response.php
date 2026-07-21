@@ -120,7 +120,7 @@ final class Response implements ResponseInterface
         http_response_code($this->status);
 
         foreach ($this->headers as $name => $value) {
-            header($name . ': ' . $value);
+            header($name . ': ' . $value, strcasecmp($name, 'Set-Cookie') !== 0);
         }
 
         foreach ($this->cookies as $cookie) {

@@ -238,32 +238,44 @@ $cookie = Cookie::make(
     secure: true,
     httpOnly: true,
     sameSite: SameSite::Lax,
+    domain: 'example.com',
+    maxAge: 2_592_000,
 );
 
 return Response::html('Saved')->withCookie($cookie);
 ```
 
-`withCookie()` returns a new response. Multiple calls retain multiple cookies and `send()` emits each one as a separate `Set-Cookie` header. Cookie values are percent-encoded during serialization. Invalid names, CR/LF injection, unsafe paths, unsupported SameSite values, `SameSite=None` without `Secure`, invalid `__Secure-` or `__Host-` prefix attributes, and expiration years outside 1601 through 9999 are rejected before a response can be sent. `send()` also fails explicitly if PHP has already committed response headers.
+`withCookie()` returns a new response. Multiple calls retain multiple cookies, including duplicate names with different paths, and `send()` emits each one as a separate `Set-Cookie` header without replacing unrelated `Set-Cookie` headers. Cookie values are percent-encoded, so Unicode and reserved value characters are serialized rather than copied into the header. Raw control characters are rejected.
+
+Cookie names must use HTTP token syntax. Paths must begin with `/` and use visible ASCII without spaces or semicolons; percent-encode non-ASCII URL paths before using them. Domains are optional, ASCII-only host names; convert internationalized names to punycode before passing them. Negative `Max-Age`, unsupported SameSite values, `SameSite=None` without `Secure`, invalid `__Secure-` or `__Host-` attributes, and expiration years outside 1601 through 9999 are rejected. Use `Cookie::forget('session', path: '/', domain: 'example.com')` to produce an explicit `Expires` plus `Max-Age=0` deletion cookie. `send()` fails explicitly if PHP has already committed response headers.
 
 Sessions remain an explicit application choice. Bind the contract to the native PHP driver in application bootstrap when session state is needed:
 
 ```php
+use Meulah\Http\SameSite;
 use Meulah\Session\NativeSession;
 use Meulah\Session\Session;
+use Meulah\Session\SessionMiddleware;
+
+$secureCookies = $app->config()->bool('session.secure', true);
 
 $container->singleton(
     Session::class,
-    static fn (): Session => new NativeSession(
+    static fn () use ($secureCookies): Session => new NativeSession(
         name: 'MEULAHSESSID',
-        secure: true,
+        secure: $secureCookies,
         httpOnly: true,
         sameSite: SameSite::Lax,
     ),
 );
+
+$session = $container->get(Session::class);
+$app->middleware(new SessionMiddleware($session));
 ```
 
-`NativeSession` starts lazily on the first session operation; reading a request cookie never starts it. It enables PHP strict session IDs, cookie-only transport, disabled URL ID propagation, HttpOnly cookies, and SameSite protection. Its default cookie is Secure; local plain-HTTP development must opt out explicitly with `secure: false`.
-Bind `NativeSession` as a request-scoped singleton. Two wrapper instances are not allowed to manage the same active native session because doing so could age flash data twice; an adopted active session must also have the same configured cookie attributes.
+`NativeSession` starts lazily on the first session operation; `SessionMiddleware` does not force a start and always closes the session after downstream handling, including exceptions. Startup enables strict session IDs, cookie-only transport, disabled URL ID propagation, explicit cookie attributes, and validation of attacker-controlled identifiers. Unknown IDs are rejected by PHP strict mode. Invalid ID syntax is discarded without exposing native warnings.
+
+Bind one `NativeSession` instance per application request when possible. Two wrappers cannot manage the same active session, and unmanaged active native sessions are rejected. On `close()`, Meulah writes the session and clears `$_SESSION` plus the process-local session ID, preventing a retained object in a long-running worker from inheriting the previous request's state. The next start selects the incoming session cookie explicitly.
 
 ```php
 $user = $session->get('user');
@@ -272,9 +284,20 @@ $session->remove('temporary');
 $session->regenerate();
 $session->invalidate();
 $session->flash('notice', 'Profile saved.');
+$session->keep('notice');
+$session->reflash();
 ```
 
-`regenerate()` rotates the identifier while preserving data. `invalidate()` clears all session data and rotates the identifier. Flash data is available during the request that creates it and the following request, then is removed when the next request starts. Session operations must happen before response output is sent. Long-running workers must call `close()` at the end of each request and must not retain the session wrapper across requests.
+`regenerate()` rotates the identifier while preserving ordinary and flash data. Call it immediately after authentication or another authentication-sensitive privilege change to prevent fixation. `invalidate()` clears all data, rotates the identifier, and emits an explicit deletion cookie for the browser. Both operations fail before invoking PHP when response output has already started.
+
+Flash lifecycle is request-based and deterministic:
+
+- `flash()` creates new flash data that is readable immediately and during the next request.
+- At the start of that next request it becomes old flash data.
+- At the start of the following request it is removed unless `keep()` retained selected keys or `reflash()` retained all old keys.
+- Writing an ordinary value with `put()` removes that key's flash marker. Repeated `flash()` calls overwrite the value without duplicating lifecycle metadata.
+
+Secure cookies remain the default. Production should use HTTPS, `secure: true`, `httpOnly: true`, `SameSite::Lax` or `SameSite::Strict`, and should omit `domain` unless subdomain sharing is required. For local plain-HTTP development, set an explicit local configuration value such as `session.secure => false`; Meulah never weakens Secure automatically because the host looks local. `SameSite::None` always requires Secure.
 
 Only the native PHP driver exists in this milestone. Its persistence is controlled by PHP's configured session save handler. File, database, and Redis drivers remain future adapters behind the same `Session` contract.
 
