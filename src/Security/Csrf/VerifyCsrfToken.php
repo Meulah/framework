@@ -30,20 +30,27 @@ final class VerifyCsrfToken implements Middleware
             return $next->handle($request);
         }
 
-        $formToken = $request->form(Csrf::FIELD);
-        $headerToken = $request->header(Csrf::HEADER);
+        $form = $request->form();
+        $formPresent = array_key_exists(Csrf::FIELD, $form);
+        $headerPresent = $request->hasHeader(Csrf::HEADER);
+        $formToken = $formPresent ? $form[Csrf::FIELD] : null;
+        $headerToken = $headerPresent ? $request->header(Csrf::HEADER) : null;
 
-        if (
-            $formToken !== null
-            && $headerToken !== null
-            && (!is_string($formToken)
+        if ($formPresent && $headerPresent) {
+            if (
+                !is_string($formToken)
                 || !is_string($headerToken)
-                || !hash_equals($formToken, $headerToken))
-        ) {
-            throw new CsrfTokenMismatch();
+                || !$this->csrf->isValid($formToken)
+                || !$this->csrf->isValid($headerToken)
+                || !hash_equals($formToken, $headerToken)
+            ) {
+                throw new CsrfTokenMismatch();
+            }
+
+            return $next->handle($request);
         }
 
-        $token = $headerToken ?? $formToken;
+        $token = $headerPresent ? $headerToken : ($formPresent ? $formToken : null);
 
         if (!$this->csrf->isValid($token)) {
             throw new CsrfTokenMismatch();
@@ -63,6 +70,7 @@ final class VerifyCsrfToken implements Middleware
             !is_string($path)
             || $path === ''
             || !str_starts_with($path, '/')
+            || preg_match('/%(?![0-9A-Fa-f]{2})/', $path) === 1
         ) {
             throw new CsrfConfigurationException(
                 'CSRF exclusions must be explicit route paths without patterns or query strings.',

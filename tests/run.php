@@ -410,13 +410,39 @@ $test('CSRF validation does not create session state for missing tokens', static
     $assertSame([], $session->data);
 });
 
+$test('CSRF rejects malformed token shapes before session access', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $csrf = new Csrf($session);
+    $invalidTokens = [
+        null,
+        '',
+        str_repeat('a', Csrf::TOKEN_LENGTH - 1),
+        str_repeat('a', Csrf::TOKEN_LENGTH + 1),
+        str_repeat('a', 1_048_576),
+        str_repeat('A', Csrf::TOKEN_LENGTH),
+        str_repeat('g', Csrf::TOKEN_LENGTH),
+        [],
+        new stdClass(),
+    ];
+
+    foreach ($invalidTokens as $invalidToken) {
+        $assertSame(false, $csrf->isValid($invalidToken));
+    }
+
+    $assertSame(false, $session->isStarted());
+    $assertSame([], $session->data);
+    $assertSame(false, $csrf->isValid(str_repeat('a', Csrf::TOKEN_LENGTH)));
+    $assertSame(true, $session->isStarted());
+    $assertSame([], $session->data);
+});
+
 $test('CSRF tokens are random stable and bound to the session identifier', static function () use ($assertSame, $sessionFactory): void {
     $session = $sessionFactory();
     $csrf = new Csrf($session);
     $token = $csrf->token();
 
-    $assertSame(64, strlen($token));
-    $assertSame(1, preg_match('/^[a-f0-9]{64}$/D', $token));
+    $assertSame(Csrf::TOKEN_LENGTH, strlen($token));
+    $assertSame(1, preg_match('/^[a-f0-9]{' . Csrf::TOKEN_LENGTH . '}$/D', $token));
     $assertSame($token, $csrf->token());
     $assertSame(true, $csrf->isValid($token));
     $assertSame(
@@ -432,7 +458,11 @@ $test('CSRF tokens are random stable and bound to the session identifier', stati
     $assertSame(true, $csrf->isValid($regeneratedToken));
 
     $session->invalidate();
-    $assertSame(false, hash_equals($regeneratedToken, $csrf->token()));
+    $assertSame(false, $csrf->isValid($regeneratedToken));
+    $replacementToken = $csrf->token();
+    $assertSame(false, hash_equals($regeneratedToken, $replacementToken));
+    $assertSame(false, $csrf->isValid($regeneratedToken));
+    $assertSame(true, $csrf->isValid($replacementToken));
 });
 
 $test('CSRF middleware protects unsafe methods and accepts form or header tokens', static function () use ($assertSame, $sessionFactory): void {
@@ -503,13 +533,224 @@ $test('CSRF middleware protects unsafe methods and accepts form or header tokens
     $assertSame(419, $conflicting->status());
 });
 
+$test('CSRF token sources reject malformed values and conflicts without warnings', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $token = (new Csrf($session))->token();
+    $otherToken = ($token[0] === 'a' ? 'b' : 'a') . substr($token, 1);
+    $router = new Router();
+    $router->post('/submit', static fn (): string => 'accepted');
+    $application = new Application($router);
+    $application->middleware(new VerifyCsrfToken($session));
+    $warnings = [];
+
+    set_error_handler(static function (int $severity, string $message) use (&$warnings): bool {
+        $warnings[] = $message;
+        return true;
+    });
+
+    $attacks = [
+        ['body' => [], 'headers' => []],
+        ['body' => [Csrf::FIELD => null], 'headers' => [Csrf::HEADER => $token]],
+        ['body' => [Csrf::FIELD => ''], 'headers' => []],
+        ['body' => [Csrf::FIELD => '   '], 'headers' => []],
+        ['body' => [Csrf::FIELD => str_repeat('a', Csrf::TOKEN_LENGTH - 1)], 'headers' => []],
+        ['body' => [Csrf::FIELD => str_repeat('a', 1_048_576)], 'headers' => []],
+        ['body' => [Csrf::FIELD => [$token]], 'headers' => []],
+        ['body' => [Csrf::FIELD => new stdClass()], 'headers' => []],
+        ['body' => [Csrf::FIELD => $token], 'headers' => [Csrf::HEADER => [$token]]],
+        ['body' => [Csrf::FIELD => $token], 'headers' => [Csrf::HEADER => new stdClass()]],
+        ['body' => [Csrf::FIELD => $token], 'headers' => [Csrf::HEADER => $otherToken]],
+    ];
+
+    try {
+        foreach ($attacks as $attack) {
+            $response = $application->handle(new Request(
+                'POST',
+                '/submit',
+                body: $attack['body'],
+                headers: $attack['headers'],
+            ));
+
+            $assertSame(419, $response->status());
+            $assertSame(false, str_contains($response->content(), $token));
+        }
+    } finally {
+        restore_error_handler();
+    }
+
+    $matching = $application->handle(new Request(
+        'POST',
+        '/submit',
+        body: [Csrf::FIELD => $token],
+        headers: [Csrf::HEADER => $token],
+    ));
+
+    $assertSame(200, $matching->status());
+    $assertSame('accepted', $matching->content());
+    $assertSame([], $warnings);
+});
+$test('CSRF protects every unsafe routed method and defines content type behavior', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $token = (new Csrf($session))->token();
+    $router = new Router();
+    $router->get('/resource', static fn (): string => 'read');
+    $router->post('/resource', static fn (): string => 'post');
+    $router->put('/resource', static fn (): string => 'put');
+    $router->patch('/resource', static fn (): string => 'patch');
+    $router->delete('/resource', static fn (): string => 'delete');
+    $router->options('/resource', static fn (): string => 'options');
+    $router->match(['PROPFIND'], '/resource', static fn (): string => 'propfind');
+    $router->post('/json', static function (Request $request): string {
+        $request->jsonObject();
+        return 'json';
+    });
+    $application = new Application($router);
+    $application->middleware(new VerifyCsrfToken($session));
+
+    $accepted = [
+        ['post', new Request('POST', '/resource', body: [Csrf::FIELD => $token], headers: ['Content-Type' => 'application/x-www-form-urlencoded'])],
+        ['post', new Request('POST', '/resource', body: [Csrf::FIELD => $token], headers: ['Content-Type' => 'multipart/form-data; boundary=test'])],
+        ['post', new Request('POST', '/resource', body: [Csrf::FIELD => $token])],
+        ['put', new Request('PUT', '/resource', headers: [Csrf::HEADER => $token])],
+        ['patch', new Request('PATCH', '/resource', headers: [Csrf::HEADER => $token])],
+        ['delete', new Request('DELETE', '/resource', headers: [Csrf::HEADER => $token])],
+        ['propfind', new Request('PROPFIND', '/resource', headers: [Csrf::HEADER => $token])],
+        ['json', new Request('POST', '/json', headers: ['Content-Type' => 'application/json', Csrf::HEADER => $token], rawBody: '{}')],
+    ];
+
+    foreach ($accepted as [$content, $request]) {
+        $assertSame($content, $application->handle($request)->content());
+    }
+
+    $assertSame('read', $application->handle(new Request('GET', '/resource'))->content());
+    $head = $application->handle(new Request('HEAD', '/resource'));
+    $assertSame(200, $head->status());
+    $assertSame('', $head->content());
+    $assertSame('options', $application->handle(new Request('OPTIONS', '/resource'))->content());
+    $assertSame(419, $application->handle(new Request('PROPFIND', '/resource'))->status());
+
+    $jsonBodyOnly = $application->handle(new Request(
+        'POST',
+        '/json',
+        headers: ['Content-Type' => 'application/json'],
+        rawBody: json_encode([Csrf::FIELD => $token], JSON_THROW_ON_ERROR),
+    ));
+    $assertSame(419, $jsonBodyOnly->status());
+
+    $malformedWithToken = $application->handle(new Request(
+        'POST',
+        '/json',
+        headers: ['Content-Type' => 'application/json', Csrf::HEADER => $token],
+        rawBody: '{',
+    ));
+    $malformedPayload = json_decode($malformedWithToken->content(), true, 512, JSON_THROW_ON_ERROR);
+    $assertSame(400, $malformedWithToken->status());
+    $assertSame('invalid_json', $malformedPayload['error']['code']);
+
+    $malformedWithoutToken = $application->handle(new Request(
+        'POST',
+        '/json',
+        headers: ['Content-Type' => 'application/json'],
+        rawBody: '{',
+    ));
+    $assertSame(419, $malformedWithoutToken->status());
+});
+$test('CSRF failures stay inside the exception boundary without leaking or logging tokens', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $token = (new Csrf($session))->token();
+    $logger = new class implements Logger {
+        public int $errors = 0;
+
+        public function error(Throwable $exception): void
+        {
+            $this->errors++;
+        }
+    };
+    $router = new Router();
+    $router->post('/transfer', static fn (): string => 'transferred');
+    $application = new Application(
+        $router,
+        exceptions: new ExceptionHandler(false, $logger),
+    );
+    $application->middleware(new VerifyCsrfToken($session));
+
+    $html = $application->handle(new Request('POST', '/transfer'));
+    $json = $application->handle(new Request(
+        'POST',
+        '/transfer',
+        headers: ['Accept' => 'application/json'],
+    ));
+    $payload = json_decode($json->content(), true, 512, JSON_THROW_ON_ERROR);
+
+    $assertSame(419, $html->status());
+    $assertSame('<h1>419</h1><p>Page expired.</p>', $html->content());
+    $assertSame(false, str_contains($html->content(), $token));
+    $assertSame(419, $json->status());
+    $assertSame('csrf_token_mismatch', $payload['error']['code']);
+    $assertSame('CSRF token mismatch.', $payload['error']['message']);
+    $assertSame(false, str_contains($json->content(), $token));
+    $assertSame(0, $logger->errors);
+});
 $test('CSRF exclusions reject route patterns and query strings', static function () use ($sessionFactory): void {
-    foreach (['webhooks/provider', '/webhooks/*', '/users/{user}', '/callback?trusted=yes', '/callback%3Ftrusted=yes', '/callback%23fragment', '/webhooks/%2A'] as $exclusion) {
+    foreach ([
+        'webhooks/provider',
+        '/webhooks/*',
+        '/users/{user}',
+        '/callback?trusted=yes',
+        '/callback%3Ftrusted=yes',
+        '/callback%23fragment',
+        '/webhooks/%2A',
+        '/callback%',
+        '/callback%2',
+        '/callback%GG',
+    ] as $exclusion) {
         try {
             new VerifyCsrfToken($sessionFactory(), [$exclusion]);
             throw new RuntimeException('Expected non-explicit CSRF exclusion rejection.');
         } catch (CsrfConfigurationException) {
         }
+    }
+});
+$test('CSRF exclusions match only the normalized application-relative path', static function () use ($assertSame, $sessionFactory): void {
+    $router = new Router();
+    $router->post('/webhooks/provider', static fn (): string => 'excluded');
+    $router->post('/webhooks//provider', static fn (): string => 'duplicate');
+    $router->post('/Webhooks/provider', static fn (): string => 'case');
+    $router->post('/webhooks/provider/child', static fn (): string => 'child');
+    $application = new Application($router);
+    $application->middleware(new VerifyCsrfToken($sessionFactory(), ['/webhooks/provider']));
+
+    foreach ([
+        '/webhooks/provider',
+        '/webhooks/provider/',
+        '/webhooks%2Fprovider',
+        '/webhooks/%70rovider',
+    ] as $path) {
+        $assertSame('excluded', $application->handle(new Request('POST', $path))->content());
+    }
+
+    $assertSame(419, $application->handle(new Request('POST', '/webhooks//provider'))->status());
+    $assertSame(419, $application->handle(new Request('POST', '/Webhooks/provider'))->status());
+    $assertSame(419, $application->handle(new Request('POST', '/webhooks/provider/child'))->status());
+
+    $originalGet = $_GET;
+    $originalPost = $_POST;
+    $originalServer = $_SERVER;
+
+    try {
+        $_GET = ['signature' => 'present'];
+        $_POST = [];
+        $_SERVER['REQUEST_METHOD'] = 'POST';
+        $_SERVER['REQUEST_URI'] = '/app/webhooks/provider/?signature=present';
+        $_SERVER['SCRIPT_NAME'] = '/app/index.php';
+
+        $captured = Request::capture();
+        $assertSame('/webhooks/provider', $captured->path());
+        $assertSame('excluded', $application->handle($captured)->content());
+    } finally {
+        $_GET = $originalGet;
+        $_POST = $originalPost;
+        $_SERVER = $originalServer;
     }
 });
 
@@ -527,11 +768,26 @@ $test('POST requests support controlled form and header method overrides', stati
     $header = new Request('post', '/users/42', headers: ['X-HTTP-Method-Override' => 'DELETE']);
     $get = new Request('GET', '/users/42', body: ['_method' => 'TRACE']);
     $query = new Request('POST', '/users/42', query: ['_method' => 'PUT']);
+    $matching = new Request(
+        'POST',
+        '/users/42',
+        body: ['_method' => ' patch '],
+        headers: ['X-HTTP-Method-Override' => 'PATCH'],
+    );
+    $getWithOverrides = new Request(
+        'GET',
+        '/users/42',
+        body: ['_method' => ['DELETE']],
+        headers: ['X-HTTP-Method-Override' => ['DELETE']],
+    );
 
     $assertSame('POST', $form->originalMethod());
     $assertSame('PATCH', $form->method());
     $assertSame('DELETE', $header->method());
     $assertSame('GET', $get->method());
+    $assertSame('POST', $matching->originalMethod());
+    $assertSame('PATCH', $matching->method());
+    $assertSame('GET', $getWithOverrides->method());
     $assertSame('POST', $query->method());
 });
 
@@ -541,6 +797,16 @@ $test('method overrides reject unsupported non-string and conflicting values', s
             ['body' => ['_method' => 'OPTIONS'], 'headers' => []],
             ['body' => ['_method' => ['PATCH']], 'headers' => []],
             ['body' => ['_method' => 'PUT'], 'headers' => ['X-HTTP-Method-Override' => 'DELETE']],
+            ['body' => ['_method' => new stdClass()], 'headers' => []],
+            ['body' => ['_method' => null], 'headers' => []],
+            ['body' => ['_method' => ''], 'headers' => []],
+            ['body' => ['_method' => "PATCH\r\n"], 'headers' => []],
+            ['body' => ['_method' => "\tPATCH"], 'headers' => []],
+            ['body' => [], 'headers' => ['X-HTTP-Method-Override' => ['PATCH']]],
+            ['body' => [], 'headers' => ['X-HTTP-Method-Override' => new stdClass()]],
+            ['body' => [], 'headers' => ['X-HTTP-Method-Override' => 'PATCH, DELETE']],
+            ['body' => [], 'headers' => ['X-HTTP-Method-Override' => "PATCH\r\n"]],
+            ['body' => [], 'headers' => ['X-HTTP-Method-Override' => 'PATCH', 'x-http-method-override' => 'PATCH']],
         ] as $input
     ) {
         try {
@@ -553,6 +819,31 @@ $test('method overrides reject unsupported non-string and conflicting values', s
     }
 });
 
+$test('method spoofing reports and routes the effective method before CSRF verification', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $token = (new Csrf($session))->token();
+    $router = new Router();
+    $router->patch('/profile', static fn (Request $request): string => $request->method() . '|' . $request->originalMethod());
+    $application = new Application($router);
+    $application->middleware(new VerifyCsrfToken($session));
+
+    $accepted = $application->handle(new Request(
+        'POST',
+        '/profile',
+        body: [
+            '_method' => 'PATCH',
+            Csrf::FIELD => $token,
+        ],
+    ));
+    $missing = $application->handle(new Request(
+        'POST',
+        '/profile',
+        body: ['_method' => 'PATCH'],
+    ));
+
+    $assertSame('PATCH|POST', $accepted->content());
+    $assertSame(419, $missing->status());
+});
 $test('captured POST requests apply method overrides before routing', static function () use ($assertSame): void {
     $originalGet = $_GET;
     $originalPost = $_POST;

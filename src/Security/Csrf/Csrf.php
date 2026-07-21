@@ -11,6 +11,8 @@ final class Csrf
 {
     public const FIELD = '_token';
     public const HEADER = 'X-CSRF-Token';
+    public const TOKEN_BYTES = 32;
+    public const TOKEN_LENGTH = self::TOKEN_BYTES * 2;
 
     private const TOKEN_KEY = '__meulah_csrf_token';
     private const SESSION_KEY = '__meulah_csrf_session';
@@ -26,10 +28,8 @@ final class Csrf
         $storedFingerprint = $this->session->get(self::SESSION_KEY);
 
         if (
-            is_string($token)
-            && strlen($token) === 64
-            && preg_match('/^[a-f0-9]{64}$/D', $token) === 1
-            && is_string($storedFingerprint)
+            $this->hasTokenShape($token)
+            && $this->hasTokenShape($storedFingerprint)
             && hash_equals($storedFingerprint, $fingerprint)
         ) {
             return $token;
@@ -40,7 +40,7 @@ final class Csrf
 
     public function regenerate(): string
     {
-        $token = bin2hex(random_bytes(32));
+        $token = bin2hex(random_bytes(self::TOKEN_BYTES));
         $this->session->put(self::TOKEN_KEY, $token);
         $this->session->put(self::SESSION_KEY, $this->sessionFingerprint());
 
@@ -49,7 +49,7 @@ final class Csrf
 
     public function isValid(mixed $token): bool
     {
-        if (!is_string($token) || $token === '') {
+        if (!$this->hasTokenShape($token)) {
             return false;
         }
 
@@ -57,10 +57,8 @@ final class Csrf
         $storedToken = $this->session->get(self::TOKEN_KEY);
         $storedFingerprint = $this->session->get(self::SESSION_KEY);
 
-        return is_string($storedToken)
-            && strlen($storedToken) === 64
-            && preg_match('/^[a-f0-9]{64}$/D', $storedToken) === 1
-            && is_string($storedFingerprint)
+        return $this->hasTokenShape($storedToken)
+            && $this->hasTokenShape($storedFingerprint)
             && hash_equals($storedFingerprint, $fingerprint)
             && hash_equals($storedToken, $token);
     }
@@ -81,5 +79,12 @@ final class Csrf
         }
 
         return hash('sha256', $id);
+    }
+
+    private function hasTokenShape(mixed $token): bool
+    {
+        return is_string($token)
+            && strlen($token) === self::TOKEN_LENGTH
+            && preg_match('/^[a-f0-9]{' . self::TOKEN_LENGTH . '}$/D', $token) === 1;
     }
 }

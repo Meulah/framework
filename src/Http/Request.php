@@ -43,7 +43,9 @@ final class Request
             throw new BadRequest('The request method is invalid.', 'invalid_http_method');
         }
 
-        $this->headers = self::normalizeHeaders($headers);
+        [$normalizedHeaders, $invalidHeaders] = self::normalizeHeaders($headers, $method === 'POST');
+        $this->headers = $normalizedHeaders;
+        $this->invalidHeaders = $invalidHeaders;
         $this->originalMethod = $method;
         $this->method = $this->resolveMethod($this->originalMethod);
         $this->path = self::normalizePath($path);
@@ -51,6 +53,9 @@ final class Request
 
     /** @var array<string, string> */
     private readonly array $headers;
+
+    /** @var array<string, true> */
+    private readonly array $invalidHeaders;
 
     public static function capture(int $maxBodySize = 10_485_760): self
     {
@@ -194,7 +199,13 @@ final class Request
             return $this->headers;
         }
 
-        return $this->headers[strtolower($name)] ?? $default;
+        $normalizedName = strtolower($name);
+
+        if (array_key_exists($normalizedName, $this->invalidHeaders)) {
+            return $default;
+        }
+
+        return $this->headers[$normalizedName] ?? $default;
     }
 
     public function headers(): array
@@ -204,7 +215,9 @@ final class Request
 
     public function hasHeader(string $name): bool
     {
-        return array_key_exists(strtolower($name), $this->headers);
+        $normalizedName = strtolower($name);
+        return array_key_exists($normalizedName, $this->headers)
+            || array_key_exists($normalizedName, $this->invalidHeaders);
     }
 
     public function cookie(?string $name = null, mixed $default = null): mixed
@@ -512,7 +525,14 @@ final class Request
             );
         }
 
-        $method = strtoupper(trim($value));
+        if (preg_match('/[\x00-\x1F\x7F]/', $value) === 1) {
+            throw new BadRequest(
+                sprintf('The %s contains invalid control characters.', $source),
+                'invalid_method_override',
+            );
+        }
+
+        $method = strtoupper(trim($value, ' '));
 
         if (!in_array($method, ['PUT', 'PATCH', 'DELETE'], true)) {
             throw new BadRequest(
@@ -524,17 +544,39 @@ final class Request
         return $method;
     }
 
-    private static function normalizeHeaders(array $headers): array
+    /** @return array{array<string, string>, array<string, true>} */
+    private static function normalizeHeaders(array $headers, bool $validateMethodOverride = false): array
     {
         $normalized = [];
+        $invalid = [];
+        $methodOverrideSeen = false;
 
         foreach ($headers as $name => $value) {
-            if (is_string($name) && is_scalar($value)) {
-                $normalized[strtolower($name)] = (string) $value;
+            $normalizedName = is_string($name) ? strtolower($name) : null;
+
+            if ($validateMethodOverride && $normalizedName === 'x-http-method-override') {
+                if ($methodOverrideSeen || !is_scalar($value)) {
+                    throw new BadRequest(
+                        'The X-HTTP-Method-Override header must be one scalar value.',
+                        'invalid_method_override',
+                    );
+                }
+
+                $methodOverrideSeen = true;
+            }
+
+            if (is_string($name) && !is_scalar($value)) {
+                $invalid[$normalizedName] = true;
+                unset($normalized[$normalizedName]);
+                continue;
+            }
+
+            if (is_string($name) && is_scalar($value) && !isset($invalid[$normalizedName])) {
+                $normalized[$normalizedName] = (string) $value;
             }
         }
 
-        return $normalized;
+        return [$normalized, $invalid];
     }
 
     private static function headersFromServer(array $server): array

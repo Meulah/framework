@@ -158,7 +158,9 @@ For server-rendered forms, a POST request may explicitly represent `PUT`, `PATCH
 </form>
 ```
 
-The `X-HTTP-Method-Override` header is also supported for clients that cannot send those methods directly. Overrides are considered only when the original method is `POST`, and only `PUT`, `PATCH`, or `DELETE` are accepted. Query-string overrides are ignored; unsupported, non-string, or conflicting form/header values produce a `400` response. The effective method is resolved while constructing the request, before routing. Use `originalMethod()` when application code needs to distinguish the transport method from `method()`.
+The `X-HTTP-Method-Override` header is also supported for clients that cannot send those methods directly. Overrides are considered only when the original method is `POST`, and only `PUT`, `PATCH`, or `DELETE` are accepted. Query-string overrides are ignored. Regular ASCII spaces around a string value are allowed; controls, empty values, arrays, objects, comma-separated method lists, and duplicate override headers produce `400 invalid_method_override`.
+
+When both the form field and header are present, their normalized values must match. Matching values are accepted deliberately; conflicts produce `400`. Overrides on GET or any other original method are ignored, even when an `_method` field is present. The effective method is resolved while constructing the request, before CSRF middleware and routing. Use `originalMethod()` for the transport method and `method()` for the effective method.
 Original request methods must also be valid HTTP tokens. Invalid method text, non-string server path metadata, malformed `Content-Length` values, and control characters in decoded request paths produce a `400` response before routing.
 
 Request data remains explicit:
@@ -325,10 +327,11 @@ Render the hidden field inside every state-changing server-rendered form:
 </form>
 ~~~
 
-The generated token contains 256 bits of cryptographic randomness, is stored in the session, and is compared with hash_equals(). It is bound to the current session identifier. After regenerate() or invalidate() rotates that identifier, the next CSRF access creates a new token and the previous token no longer validates.
-`isValid()` is read-only: checking an absent or stale token does not create CSRF session state. Call `token()` or `field()` when an application intentionally needs a token.
+Tokens are generated from 32 cryptographically random bytes and encoded as exactly 64 lowercase hexadecimal characters. The encoded token and a SHA-256 fingerprint of the session identifier are stored in the session. Supplied and stored values must have the expected shape before comparison with `hash_equals()`.
 
-VerifyCsrfToken requires a valid token for every method except GET, HEAD, and OPTIONS. Method spoofing happens first, so forms representing PUT, PATCH, or DELETE are protected as unsafe requests.
+The token remains valid across ordinary requests while the session identifier is unchanged. Regenerating the session identifier immediately invalidates the old token; the next call to `token()` or `field()` creates its replacement. `invalidate()` clears the token and rotates the session, so a token captured before logout cannot be replayed. `isValid()` is read-only, and malformed tokens are rejected before session access.
+
+`VerifyCsrfToken` requires a valid token for every method except GET, HEAD, and OPTIONS. This includes POST, PUT, PATCH, DELETE, and custom unsafe methods supported by the router. Method spoofing happens first, so CSRF checks use the effective method while `originalMethod()` remains available for diagnostics.
 
 JavaScript clients may send the token through the documented header:
 
@@ -336,7 +339,9 @@ JavaScript clients may send the token through the documented header:
 X-CSRF-Token: <token>
 ~~~
 
-The middleware reads ordinary forms only from the _token field. If both the field and header are supplied, they must agree. Missing, malformed, stale, or conflicting tokens produce a 419 Page Expired response; JSON clients receive the stable csrf_token_mismatch error code.
+For URL-encoded and multipart requests, the middleware reads the parsed `_token` form field. JSON requests must use `X-CSRF-Token`; a token embedded in raw JSON is deliberately ignored. If both supported sources are present, each must be valid and their values must match. Null, array, object, truncated, oversized, malformed, stale, or conflicting values produce a 419 response without exposing the submitted or stored token.
+
+HTML clients receive a safe `Page Expired` response. JSON clients receive the stable `csrf_token_mismatch` error code. A malformed JSON body with a valid header proceeds to normal request parsing and may produce `400 invalid_json`; without a valid CSRF token, the security check fails first with 419.
 
 Exclusions are exact normalized paths:
 
@@ -346,7 +351,9 @@ new VerifyCsrfToken($session, except: [
 ]);
 ~~~
 
-Wildcards, route parameters, prefixes, and query-string conditions are rejected, including percent-encoded forms of those characters. Exclusions are decoded before validation. Each excluded endpoint must therefore be an explicit security decision.
+Exclusions are matched case-sensitively against the application-relative request path after one percent-decoding and the framework's documented path normalization. Query strings are removed during request capture, a configured trailing slash is normalized consistently, and an application subdirectory is stripped. Duplicate internal slashes remain distinct, preventing them from silently becoming an excluded path.
+
+Wildcards, route parameters, prefixes, query-string conditions, and malformed percent escapes are rejected, including percent-encoded forms of reserved exclusion syntax. Each excluded endpoint must therefore be an explicit security decision.
 
 ## Validation
 
