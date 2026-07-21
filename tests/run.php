@@ -5,6 +5,9 @@ declare(strict_types=1);
 use Meulah\Auth\Authenticatable;
 use Meulah\Auth\Guard;
 use Meulah\Auth\InvalidAuthenticatableException;
+use Meulah\Auth\NativePasswordHasher;
+use Meulah\Auth\PasswordHasher;
+use Meulah\Auth\PasswordHashingException;
 use Meulah\Auth\SessionGuard;
 use Meulah\Auth\UserProvider;
 use Meulah\Application;
@@ -104,6 +107,7 @@ $sessionFactory = static function (): Session {
         private string $identifier = 'test-session-one';
         public bool $started = false;
         public int $closeCount = 0;
+        public bool $failRegeneration = false;
 
         public function start(): void
         {
@@ -142,6 +146,10 @@ $sessionFactory = static function (): Session {
 
         public function regenerate(): void
         {
+            if ($this->failRegeneration) {
+                throw new SessionException('Unable to regenerate test session.');
+            }
+
             $this->start();
             $this->identifier = 'test-session-' . bin2hex(random_bytes(8));
         }
@@ -417,7 +425,7 @@ $test('session middleware closes sessions when downstream handling fails', stati
 $test('session guard represents ordinary guest state without consulting the provider', static function () use ($assertSame, $sessionFactory): void {
     $session = $sessionFactory();
     $provider = new FakeUserProvider();
-    $guard = new SessionGuard($session, $provider);
+    $guard = new SessionGuard($session, $provider, '_auth_user');
 
     $assertSame(null, $guard->user());
     $assertSame(null, $guard->id());
@@ -430,7 +438,7 @@ $test('session guard login and logout rotate identifiers without storing user ob
     $session = $sessionFactory();
     $session->put('cart', ['book']);
     $provider = new FakeUserProvider();
-    $guard = new SessionGuard($session, $provider);
+    $guard = new SessionGuard($session, $provider, '_auth_user');
     $user = new FakeAuthenticatable('00042');
     $beforeLogin = $session->id();
 
@@ -438,8 +446,8 @@ $test('session guard login and logout rotate identifiers without storing user ob
 
     $afterLogin = $session->id();
     $assertSame(false, $beforeLogin === $afterLogin);
-    $assertSame('00042', $session->data['__meulah_auth_identifier']);
-    $assertSame(false, $session->data['__meulah_auth_identifier'] instanceof Authenticatable);
+    $assertSame('00042', $session->data['_auth_user']);
+    $assertSame(false, $session->data['_auth_user'] instanceof Authenticatable);
     $assertSame($user, $guard->user());
     $assertSame('00042', $guard->id());
     $assertSame(true, $guard->check());
@@ -450,10 +458,32 @@ $test('session guard login and logout rotate identifiers without storing user ob
     $guard->logout();
 
     $assertSame(false, $afterLogin === $session->id());
-    $assertSame(false, array_key_exists('__meulah_auth_identifier', $session->data));
+    $assertSame(false, array_key_exists('_auth_user', $session->data));
     $assertSame(['book'], $session->data['cart']);
     $assertSame(null, $guard->user());
     $assertSame(null, $guard->id());
+    $assertSame(true, $guard->guest());
+});
+
+$test('session guard clears cached identity when logout rotation fails', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $guard = new SessionGuard($session, new FakeUserProvider(), '_auth_user');
+    $user = new FakeAuthenticatable('rotation-user');
+    $guard->login($user);
+    $assertSame($user, $guard->user());
+
+    $session->failRegeneration = true;
+
+    try {
+        $guard->logout();
+        throw new RuntimeException('Expected logout rotation failure.');
+    } catch (SessionException $exception) {
+        $assertSame('Unable to regenerate test session.', $exception->getMessage());
+    }
+
+    $session->failRegeneration = false;
+    $assertSame(false, array_key_exists('_auth_user', $session->data));
+    $assertSame(null, $guard->user());
     $assertSame(true, $guard->guest());
 });
 
@@ -463,8 +493,8 @@ $test('session guard restores exact edge-case string identifiers and refreshes a
         $provider = new FakeUserProvider();
         $user = new FakeAuthenticatable($identifier);
         $provider->add($user);
-        $session->put('__meulah_auth_identifier', $identifier);
-        $guard = new SessionGuard($session, $provider);
+        $session->put('_auth_user', $identifier);
+        $guard = new SessionGuard($session, $provider, '_auth_user');
 
         $assertSame($user, $guard->user());
         $assertSame($identifier, $guard->id());
@@ -486,9 +516,9 @@ $test('session guard restores exact edge-case string identifiers and refreshes a
 $test('session guard rejects malformed stored and application identifiers without scalar guessing', static function () use ($assertSame, $sessionFactory): void {
     foreach ([null, 0, false, '', []] as $identifier) {
         $session = $sessionFactory();
-        $session->put('__meulah_auth_identifier', $identifier);
+        $session->put('_auth_user', $identifier);
         $provider = new FakeUserProvider();
-        $guard = new SessionGuard($session, $provider);
+        $guard = new SessionGuard($session, $provider, '_auth_user');
 
         try {
             $guard->user();
@@ -504,7 +534,7 @@ $test('session guard rejects malformed stored and application identifiers withou
     }
 
     try {
-        (new SessionGuard($sessionFactory(), new FakeUserProvider()))
+        (new SessionGuard($sessionFactory(), new FakeUserProvider(), '_auth_user'))
             ->login(new FakeAuthenticatable(''));
         throw new RuntimeException('Expected empty application identifier rejection.');
     } catch (InvalidAuthenticatableException $exception) {
@@ -517,21 +547,21 @@ $test('session guard rejects malformed stored and application identifiers withou
 
 $test('session guard treats missing users as guests and rejects provider identifier mismatches', static function () use ($assertSame, $sessionFactory): void {
     $missingSession = $sessionFactory();
-    $missingSession->put('__meulah_auth_identifier', 'deleted-user');
+    $missingSession->put('_auth_user', 'deleted-user');
     $missingProvider = new FakeUserProvider();
-    $missingGuard = new SessionGuard($missingSession, $missingProvider);
+    $missingGuard = new SessionGuard($missingSession, $missingProvider, '_auth_user');
 
     $assertSame(null, $missingGuard->user());
     $assertSame(null, $missingGuard->id());
     $assertSame(true, $missingGuard->guest());
     $assertSame(['deleted-user'], $missingProvider->retrieved);
-    $assertSame('deleted-user', $missingSession->data['__meulah_auth_identifier']);
+    $assertSame('deleted-user', $missingSession->data['_auth_user']);
 
     $mismatchSession = $sessionFactory();
-    $mismatchSession->put('__meulah_auth_identifier', 'secret-expected-91');
+    $mismatchSession->put('_auth_user', 'secret-expected-91');
     $mismatchProvider = new FakeUserProvider();
     $mismatchProvider->add(new FakeAuthenticatable('secret-actual-27'), 'secret-expected-91');
-    $mismatchGuard = new SessionGuard($mismatchSession, $mismatchProvider);
+    $mismatchGuard = new SessionGuard($mismatchSession, $mismatchProvider, '_auth_user');
 
     try {
         $mismatchGuard->user();
@@ -546,20 +576,141 @@ $test('session guard treats missing users as guests and rejects provider identif
     }
 });
 
-$test('authentication contracts compose through explicit container bindings', static function () use ($assertSame, $sessionFactory): void {
+$test('session guard requires and isolates an explicit session key', static function () use ($assertSame, $sessionFactory): void {
+    try {
+        new SessionGuard($sessionFactory(), new FakeUserProvider(), '');
+        throw new RuntimeException('Expected empty authentication session key rejection.');
+    } catch (InvalidArgumentException $exception) {
+        $assertSame('The authentication session key cannot be empty.', $exception->getMessage());
+    }
+
+    $session = $sessionFactory();
+    $guard = new SessionGuard($session, new FakeUserProvider(), '_custom_auth');
+    $guard->login(new FakeAuthenticatable('custom-user'));
+
+    $assertSame('custom-user', $session->data['_custom_auth']);
+    $assertSame(false, array_key_exists('_auth_user', $session->data));
+});
+
+$test('session guard handles repeated login switching users and external invalidation', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $session->put('intended', 'preserved');
+    $guard = new SessionGuard($session, new FakeUserProvider(), '_auth_user');
+    $alice = new FakeAuthenticatable('alice');
+    $bob = new FakeAuthenticatable('bob');
+
+    $guard->login($alice);
+    $afterAlice = $session->id();
+    $guard->login($alice);
+    $afterRepeatedLogin = $session->id();
+
+    $assertSame(false, $afterAlice === $afterRepeatedLogin);
+    $assertSame($alice, $guard->user());
+    $assertSame('preserved', $session->data['intended']);
+
+    $guard->login($bob);
+
+    $assertSame(false, $afterRepeatedLogin === $session->id());
+    $assertSame($bob, $guard->user());
+    $assertSame('bob', $guard->id());
+    $assertSame('bob', $session->data['_auth_user']);
+    $assertSame('preserved', $session->data['intended']);
+
+    $session->invalidate();
+
+    $assertSame(null, $guard->user());
+    $assertSame(null, $guard->id());
+    $assertSame(true, $guard->guest());
+});
+
+$test('session guard propagates provider failures without caching an identity', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $session->put('_auth_user', 'provider-user');
+    $provider = new class implements UserProvider {
+        public int $calls = 0;
+
+        public function retrieveById(string $identifier): ?Authenticatable
+        {
+            $this->calls++;
+            throw new DomainException('identity store unavailable');
+        }
+    };
+    $guard = new SessionGuard($session, $provider, '_auth_user');
+
+    foreach (['user', 'id'] as $method) {
+        try {
+            $guard->{$method}();
+            throw new RuntimeException('Expected provider failure.');
+        } catch (DomainException $exception) {
+            $assertSame('identity store unavailable', $exception->getMessage());
+        }
+    }
+
+    $assertSame(2, $provider->calls);
+});
+
+$test('session guard login and logout invalidate prior CSRF tokens', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $csrf = new Csrf($session);
+    $guard = new SessionGuard($session, new FakeUserProvider(), '_auth_user');
+    $beforeLogin = $csrf->token();
+
+    $guard->login(new FakeAuthenticatable('csrf-user'));
+    $afterLogin = $csrf->token();
+
+    $assertSame(false, $csrf->isValid($beforeLogin));
+    $assertSame(false, hash_equals($beforeLogin, $afterLogin));
+    $assertSame(true, $csrf->isValid($afterLogin));
+
+    $guard->logout();
+    $afterLogout = $csrf->token();
+
+    $assertSame(false, $csrf->isValid($afterLogin));
+    $assertSame(false, hash_equals($afterLogin, $afterLogout));
+    $assertSame(true, $csrf->isValid($afterLogout));
+});
+
+$test('authentication contracts compose through transient container bindings', static function () use ($assertSame, $sessionFactory): void {
     $container = new Container();
     $session = $sessionFactory();
     $provider = new FakeUserProvider();
     $user = new FakeAuthenticatable('container-user');
+    $provider->add($user);
     $container->instance(Session::class, $session);
     $container->instance(UserProvider::class, $provider);
-    $container->singleton(Guard::class, SessionGuard::class);
+    $container->bind(
+        Guard::class,
+        static fn (Container $container): Guard => new SessionGuard(
+            $container->get(Session::class),
+            $container->get(UserProvider::class),
+            '_auth_user',
+        ),
+    );
 
     $guard = $container->get(Guard::class);
     $assertSame(true, $guard instanceof SessionGuard);
-    $assertSame($guard, $container->get(Guard::class));
+    $assertSame(false, $guard === $container->get(Guard::class));
     $guard->login($user);
     $assertSame('container-user', $guard->id());
+    $assertSame($user, $container->get(Guard::class)->user());
+
+    $unconfigured = new Container();
+    $unconfigured->instance(Session::class, $sessionFactory());
+    $unconfigured->bind(
+        Guard::class,
+        static fn (Container $container): Guard => new SessionGuard(
+            $container->get(Session::class),
+            $container->get(UserProvider::class),
+            '_auth_user',
+        ),
+    );
+
+    try {
+        $unconfigured->get(Guard::class);
+        throw new RuntimeException('Expected missing user provider binding failure.');
+    } catch (BindingResolutionException $exception) {
+        $assertSame(true, str_contains($exception->getMessage(), UserProvider::class));
+    }
 
     try {
         $container->get(Authenticatable::class);
@@ -569,6 +720,131 @@ $test('authentication contracts compose through explicit container bindings', st
     }
 });
 
+
+$test('native password hashing preserves exact plaintext and uses unique salts', static function () use ($assertSame): void {
+    $hasher = new NativePasswordHasher(PASSWORD_DEFAULT, ['cost' => 4]);
+    $passwords = [
+        '',
+        'correct horse battery staple',
+        'p?ssw?rd-??',
+        ' padded password ',
+        str_repeat('long-password-', 400),
+    ];
+
+    foreach ($passwords as $plainText) {
+        $hash = $hasher->hash($plainText);
+
+        $assertSame(true, $hash !== '');
+        $assertSame(true, $hasher->verify($plainText, $hash));
+        $assertSame(false, $hasher->verify('different-' . $plainText, $hash));
+        $assertSame(false, $hasher->needsRehash($hash));
+    }
+
+    $first = $hasher->hash('same password');
+    $second = $hasher->hash('same password');
+
+    $assertSame(false, hash_equals($first, $second));
+    $assertSame(false, $hasher->verify('padded password', $hasher->hash(' padded password ')));
+});
+
+$test('native password hashing handles malformed hashes and rehash requirements predictably', static function () use ($assertSame): void {
+    $current = new NativePasswordHasher(PASSWORD_DEFAULT, ['cost' => 4]);
+    $stronger = new NativePasswordHasher(PASSWORD_DEFAULT, ['cost' => 5]);
+    $hash = $current->hash('rehash me');
+
+    $assertSame(false, $current->needsRehash($hash));
+    $assertSame(true, $stronger->needsRehash($hash));
+
+    foreach (['', 'not-a-password-hash', '$2y$broken'] as $malformed) {
+        $assertSame(false, $current->verify('password', $malformed));
+        $assertSame(true, $current->needsRehash($malformed));
+    }
+});
+
+$test('native password hashing rejects unsupported algorithms and malformed options', static function () use ($assertSame): void {
+    $secret = 'plaintext-must-never-appear';
+
+    try {
+        new NativePasswordHasher($secret);
+        throw new RuntimeException('Expected unsupported password algorithm rejection.');
+    } catch (InvalidArgumentException $exception) {
+        $assertSame('Unsupported password hashing algorithm.', $exception->getMessage());
+        $assertSame(false, str_contains($exception->getMessage(), $secret));
+    }
+
+    foreach ([
+        ['salt' => 'manual-salts-are-forbidden'],
+        ['cost' => '4'],
+        ['cost' => 3],
+        ['cost' => 32],
+        [4],
+    ] as $options) {
+        try {
+            new NativePasswordHasher(PASSWORD_DEFAULT, $options);
+            throw new RuntimeException('Expected malformed password option rejection.');
+        } catch (InvalidArgumentException $exception) {
+            $assertSame(false, str_contains($exception->getMessage(), 'manual-salts-are-forbidden'));
+        }
+    }
+
+    $hasher = new NativePasswordHasher(PASSWORD_DEFAULT, ['cost' => 4]);
+    $plainText = "secret-value\0must-not-leak";
+
+    try {
+        $hash = $hasher->hash($plainText);
+        $assertSame(true, $hasher->verify($plainText, $hash));
+    } catch (PasswordHashingException $exception) {
+        $assertSame('Unable to hash the supplied password.', $exception->getMessage());
+        $assertSame(false, str_contains($exception->getMessage(), 'must-not-leak'));
+    }
+});
+
+$test('native password hashing supports Argon2id when PHP provides it', static function () use ($assertSame): void {
+    if (!defined('PASSWORD_ARGON2ID')) {
+        return;
+    }
+
+    $algorithm = constant('PASSWORD_ARGON2ID');
+
+    if (!in_array($algorithm, password_algos(), true)) {
+        return;
+    }
+
+    $options = ['memory_cost' => 8192, 'time_cost' => 1, 'threads' => 1];
+    $hasher = new NativePasswordHasher($algorithm, $options);
+    $hash = $hasher->hash('argon password');
+
+    $assertSame(true, $hasher->verify('argon password', $hash));
+    $assertSame(false, $hasher->verify('wrong password', $hash));
+    $assertSame(false, $hasher->needsRehash($hash));
+    $assertSame(
+        true,
+        (new NativePasswordHasher($algorithm, [...$options, 'time_cost' => 2]))->needsRehash($hash),
+    );
+
+    try {
+        new NativePasswordHasher($algorithm, ['memory_cost' => 7]);
+        throw new RuntimeException('Expected invalid Argon2id option rejection.');
+    } catch (InvalidArgumentException $exception) {
+        $assertSame(
+            'Password hashing options must be integers within their supported range.',
+            $exception->getMessage(),
+        );
+    }
+});
+
+$test('password hasher is safely shared through the container', static function () use ($assertSame): void {
+    $container = new Container();
+    $container->singleton(
+        PasswordHasher::class,
+        static fn (): PasswordHasher => new NativePasswordHasher(PASSWORD_DEFAULT, ['cost' => 4]),
+    );
+
+    $hasher = $container->get(PasswordHasher::class);
+
+    $assertSame($hasher, $container->get(PasswordHasher::class));
+    $assertSame(true, $hasher->verify('container password', $hasher->hash('container password')));
+});
 $test('CSRF validation does not create session state for missing tokens', static function () use ($assertSame, $sessionFactory): void {
     $session = $sessionFactory();
     $csrf = new Csrf($session);

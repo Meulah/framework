@@ -4,13 +4,12 @@ declare(strict_types=1);
 
 namespace Meulah\Auth;
 
+use InvalidArgumentException;
 use Meulah\Session\Session;
 use stdClass;
 
 final class SessionGuard implements Guard
 {
-    private const SESSION_KEY = '__meulah_auth_identifier';
-
     private bool $resolved = false;
     private ?string $resolvedForSession = null;
     private ?Authenticatable $resolvedUser = null;
@@ -19,7 +18,11 @@ final class SessionGuard implements Guard
     public function __construct(
         private readonly Session $session,
         private readonly UserProvider $users,
+        private readonly string $sessionKey,
     ) {
+        if ($this->sessionKey === '') {
+            throw new InvalidArgumentException('The authentication session key cannot be empty.');
+        }
     }
 
     public function user(): ?Authenticatable
@@ -31,7 +34,7 @@ final class SessionGuard implements Guard
         }
 
         $missing = new stdClass();
-        $stored = $this->session->get(self::SESSION_KEY, $missing);
+        $stored = $this->session->get($this->sessionKey, $missing);
 
         if ($stored === $missing) {
             $this->remember(null, null, $sessionId);
@@ -77,16 +80,26 @@ final class SessionGuard implements Guard
     public function login(Authenticatable $user): void
     {
         $identifier = $this->identifier($user->authIdentifier(), 'Authenticatable');
+        $this->forgetResolvedUser();
         $this->session->regenerate();
-        $this->session->put(self::SESSION_KEY, $identifier);
+        $this->session->put($this->sessionKey, $identifier);
         $this->remember($user, $identifier, $this->session->id());
     }
 
     public function logout(): void
     {
-        $this->session->remove(self::SESSION_KEY);
+        $this->forgetResolvedUser();
+        $this->session->remove($this->sessionKey);
         $this->session->regenerate();
         $this->remember(null, null, $this->session->id());
+    }
+
+    private function forgetResolvedUser(): void
+    {
+        $this->resolved = false;
+        $this->resolvedForSession = null;
+        $this->resolvedUser = null;
+        $this->resolvedIdentifier = null;
     }
 
     private function identifier(mixed $identifier, string $source): string

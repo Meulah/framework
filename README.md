@@ -354,27 +354,77 @@ Meulah does not provide an ORM-backed implementation because table names, key ty
 
 Credential lookup and password verification do not belong in this contract yet. Adding `retrieveByCredentials()` would prematurely define credential-field and secret-handling conventions before an `attempt()` workflow exists. Applications remain free to build an explicit login service around their own repository and password hasher, then pass the verified identity to `Guard::login()`.
 
-Bind the application provider, the request's session, and the guard explicitly:
+Bind the application provider, the request's session, and the guard explicitly. The authentication session key is required configuration:
 
 ```php
 use Meulah\Auth\Guard;
 use Meulah\Auth\SessionGuard;
 use Meulah\Auth\UserProvider;
 use Meulah\Session\Session;
+use Meulah\Container\Container;
 
 $container = $app->container();
 $container->instance(Session::class, $session);
-$container->singleton(UserProvider::class, ApplicationUserProvider::class);
-$container->singleton(Guard::class, SessionGuard::class);
+$container->bind(UserProvider::class, ApplicationUserProvider::class);
+$container->bind(
+    Guard::class,
+    static fn (Container $container): Guard => new SessionGuard(
+        $container->get(Session::class),
+        $container->get(UserProvider::class),
+        '_auth_user',
+    ),
+);
 
 $guard = $container->get(Guard::class);
 ```
 
-`SessionGuard` stores only the string identifier, never the entire user object. `user()` restores lazily through the provider; a missing record is ordinary guest state. Invalid stored identifiers or a provider returning a different identifier throw `InvalidAuthenticatableException` without exposing either value. The in-memory result is tied to the current session ID, so session regeneration, invalidation, or request reuse causes authentication state to be resolved again.
+The configured key must be non-empty and should be reserved for the guard. It lets applications avoid collisions between session-backed components without imposing a framework-global key.
 
-`login()` rotates the session ID before storing the identifier. `logout()` removes only authentication state, rotates the session ID, and preserves unrelated session data. Because CSRF tokens are bound to the session ID, both transitions also make the previous CSRF token stale. Applications should bind one guard per request; there is no global or static authentication state.
+`SessionGuard` stores only the string identifier, never the entire user object. `user()` restores lazily through the provider and caches the result in that guard object. `id()` uses the same resolution on first access so it cannot report a deleted user as authenticated merely to avoid hydration; subsequent calls use the request-local cache. Invalid stored identifiers or a provider returning a different identifier throw `InvalidAuthenticatableException` without exposing either value. Provider exceptions propagate unchanged.
 
-No authentication manager is included because Meulah currently has one guard type and no demonstrated named-guard requirement. Also postponed are `attempt()`, credential validation, password hash contracts, authentication middleware, unauthenticated HTTP exceptions, login or registration controllers, remember-me cookies, authorization, API tokens, OAuth, and JWT.
+A provider returning `null` is ordinary guest state: `user()` and `id()` return `null`, `check()` returns `false`, and `guest()` returns `true`. The stale identifier remains in the session deliberately. Reads therefore do not mutate authentication state, and a temporary provider inconsistency does not silently sign the browser out. Applications may call `logout()` when they want to remove it.
+
+`login()` validates the identifier, clears stale in-memory resolution, rotates the session ID, then stores the identifier. Rotation preserves intended session and flash data. Repeated login and switching users rotate the identifier every time.
+
+`logout()` clears cached identity, removes only the configured authentication key, and rotates the session ID. It does not invalidate the whole session or destroy unrelated data. Because Meulah's CSRF token is bound to the session ID, both login and logout make the previous token stale; the next CSRF token access creates a replacement. If an application needs to destroy all session data, it explicitly calls `Session::invalidate()` in its logout workflow.
+
+`SessionGuard` is transient and intended to live for one request. Meulah's container has singleton and transient bindings but no request scope, and an `Application` can survive multiple requests in a long-running worker. The example therefore uses `bind()`, not `singleton()`. A singleton is safe only when the application and container are guaranteed to be rebuilt for every request. Long-running workers must create a fresh session and guard per request and must not capture either in process-global state. The cache is also tied to the current session ID, so regeneration or invalidation forces re-resolution as a defensive backstop.
+
+No authentication manager is included because Meulah currently has one guard type and no demonstrated named-guard requirement. Also postponed are `attempt()`, credential validation, authentication middleware, unauthenticated HTTP exceptions, login or registration controllers, remember-me cookies, authorization, API tokens, OAuth, and JWT.
+
+## Password hashing
+
+`PasswordHasher` provides only hashing, verification, and rehash checks. It does not retrieve users, validate credentials, persist hashes, or define a login workflow.
+
+Register the immutable native implementation as a singleton:
+
+```php
+use Meulah\Auth\NativePasswordHasher;
+use Meulah\Auth\PasswordHasher;
+
+$container->singleton(
+    PasswordHasher::class,
+    static fn (): PasswordHasher => new NativePasswordHasher(
+        PASSWORD_DEFAULT,
+    ),
+);
+```
+
+The singleton is safe because `NativePasswordHasher` retains only immutable algorithm configuration. It never stores plaintext, hashes, users, or request state.
+
+`PASSWORD_DEFAULT` is always supported. `PASSWORD_ARGON2ID` is supported only when the PHP build defines it and lists it in `password_algos()`. No fallback algorithm is selected silently, and Argon2i is not accepted for new hashes. Verification can still recognize a native hash created with another installed algorithm, allowing an application to verify it and then use `needsRehash()` to migrate it.
+
+Explicit options are strict and algorithm-specific:
+
+- The current bcrypt-backed default accepts an integer `cost` from 4 through 31.
+- Argon2id accepts integer `memory_cost` of at least 8, `time_cost` of at least 1, and `threads` of at least 1.
+- Unknown options, numeric option keys, stringified integers, and manual `salt` values are rejected. PHP may enforce additional platform and resource limits when hashing.
+
+The hasher does not trim, normalize, lowercase, or otherwise modify plaintext. Empty, Unicode, whitespace-containing, and long passwords are passed exactly to PHP's native password API. Password presence, length, and complexity are application validation policy, not hashing policy. Applications using bcrypt should account for bcrypt's native input-length behavior when defining that policy.
+
+An empty or malformed stored hash never verifies and always needs rehashing. Hashing failures use the generic `PasswordHashingException` message and never include the plaintext. Meulah does not add manual salts; PHP generates a secure random salt for every hash.
+
+PHP's `SensitiveParameter` attribute is not used because Meulah maintains a PHP 8.1 baseline where that attribute is unavailable. This does not change the security contract: applications must never log plaintext arguments, and Meulah's exceptions do not expose them.
 
 ## CSRF protection
 
