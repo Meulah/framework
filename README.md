@@ -390,7 +390,68 @@ A provider returning `null` is ordinary guest state: `user()` and `id()` return 
 
 `SessionGuard` is transient and intended to live for one request. Meulah's container has singleton and transient bindings but no request scope, and an `Application` can survive multiple requests in a long-running worker. The example therefore uses `bind()`, not `singleton()`. A singleton is safe only when the application and container are guaranteed to be rebuilt for every request. Long-running workers must create a fresh session and guard per request and must not capture either in process-global state. The cache is also tied to the current session ID, so regeneration or invalidation forces re-resolution as a defensive backstop.
 
-No authentication manager is included because Meulah currently has one guard type and no demonstrated named-guard requirement. Also postponed are `attempt()`, credential validation, authentication middleware, unauthenticated HTTP exceptions, login or registration controllers, remember-me cookies, authorization, API tokens, OAuth, and JWT.
+### Authentication middleware
+
+`RequireAuthentication` allows requests only when the guard resolves a valid user. The application must provide the rejection response; Meulah does not guess a route name, login URL, or response format:
+
+```php
+use Meulah\Auth\RequireAuthentication;
+use Meulah\Http\Request;
+use Meulah\Http\Response;
+use Meulah\Http\ResponseInterface;
+use Meulah\Routing\Router;
+
+$requireAuthentication = new RequireAuthentication(
+    guard: $guard,
+    unauthenticated: static function (Request $request): ResponseInterface {
+        return Response::redirect('/login');
+    },
+);
+
+$router->group([
+    'middleware' => [$requireAuthentication],
+], function (Router $router): void {
+    $router->get('/account', [AccountController::class, 'show']);
+});
+```
+
+APIs should create a separate instance with an explicit 401 response. The middleware never infers this choice from `Accept`, `Content-Type`, or route names:
+
+```php
+$requireApiAuthentication = new RequireAuthentication(
+    guard: $guard,
+    unauthenticated: static fn (): ResponseInterface => Response::json(
+        ['error' => ['code' => 'unauthenticated']],
+        401,
+    ),
+);
+```
+
+`RequireGuest` is the inverse for login, registration, or similar guest-only application routes. Its authenticated response is also application policy:
+
+```php
+use Meulah\Auth\RequireGuest;
+
+$requireGuest = new RequireGuest(
+    guard: $guard,
+    authenticated: static fn (): ResponseInterface => Response::redirect('/account'),
+);
+
+$router->get('/login', [LoginController::class, 'show'])
+    ->middleware($requireGuest);
+```
+
+Both classes call `Guard::check()` once, short-circuit before the controller when rejected, and require callbacks to return `ResponseInterface`. They do not log in, log out, mutate request input, attach request attributes, catch provider failures, or expose the user globally. A stale session identifier whose provider record no longer exists follows the unauthenticated path and retains the guard's documented non-mutating stale-identifier policy.
+
+For session-backed web routes, register middleware in this order:
+
+1. `SessionMiddleware` globally and outermost, so authentication can start the session lazily and the session always closes afterward.
+2. `VerifyCsrfToken` globally inside the session boundary, so every unsafe session-backed form, including guest forms, is checked.
+3. `RequireAuthentication` or `RequireGuest` on route groups or individual routes, before controllers and other route middleware that assumes an authenticated or guest identity.
+
+If CSRF is intentionally route-scoped instead, keep `SessionMiddleware` outside both and declare authentication before CSRF when the application wants rejected guests to receive the authentication response first. Middleware declaration order is execution order on the way into the handler and reverses while responses unwind.
+
+No authentication manager is included because Meulah currently has one guard type and no demonstrated named-guard requirement. Also postponed are `attempt()`, credential validation, unauthenticated HTTP exceptions, login or registration controllers, remember-me cookies, API tokens, OAuth, and JWT.
 
 ## Password hashing
 
@@ -425,6 +486,72 @@ The hasher does not trim, normalize, lowercase, or otherwise modify plaintext. E
 An empty or malformed stored hash never verifies and always needs rehashing. Hashing failures use the generic `PasswordHashingException` message and never include the plaintext. Meulah does not add manual salts; PHP generates a secure random salt for every hash.
 
 PHP's `SensitiveParameter` attribute is not used because Meulah maintains a PHP 8.1 baseline where that attribute is unavailable. This does not change the security contract: applications must never log plaintext arguments, and Meulah's exceptions do not expose them.
+
+## Authorization
+
+Meulah authorization is a small gate, not a role or permission system. Applications define exact named abilities and decide them against the current guard user plus explicit arguments. The framework does not infer ownership, query persistence, or grant administrators a hidden bypass.
+
+Register the gate with application abilities in a transient container factory:
+
+```php
+use Meulah\Auth\Authenticatable;
+use Meulah\Auth\Guard;
+use Meulah\Authorization\AuthorizationGate;
+use Meulah\Authorization\AuthorizationResult;
+use Meulah\Authorization\Gate;
+use Meulah\Container\Container;
+
+$container->bind(
+    Gate::class,
+    static function (Container $container): Gate {
+        $gate = new AuthorizationGate(
+            $container->get(Guard::class),
+            $container,
+        );
+
+        $gate->define(
+            'record.update',
+            static function (
+                Authenticatable $actor,
+                Record $record,
+            ): AuthorizationResult {
+                return $actor->authIdentifier() === $record->ownerIdentifier
+                    ? AuthorizationResult::allow()
+                    : AuthorizationResult::deny(
+                        'You cannot update this record.',
+                        'not_owner',
+                    );
+            },
+        );
+        $gate->define('record.archive', ArchiveRecordAbility::class);
+
+        return $gate;
+    },
+);
+```
+
+Use `allows()` and `denies()` for boolean decisions, `inspect()` when the application needs safe denial context, and `authorize()` when denial should interrupt the current application operation:
+
+```php
+$allowed = $gate->allows('record.update', $record);
+$result = $gate->inspect('record.update', $record);
+$gate->authorize('record.update', $record);
+```
+
+`authorize()` throws `AuthorizationException` with the generic message `This action is not authorized.` The exception exposes the ability and its `AuthorizationResult` separately so an application may deliberately map a safe message or code. Meulah never copies denial details into an HTTP response or exception message automatically.
+
+Every callback's first parameter declares guest policy:
+
+- `Authenticatable` or an application class implementing it makes the ability authenticated-only. A guest receives a plain denial without invoking the callback.
+- Nullable `?Authenticatable` opts the ability into guest evaluation. The callback receives `null` and must decide explicitly.
+
+Callbacks then receive the arguments passed to the gate without coercion. They must return strict `bool` or `AuthorizationResult`. Callback exceptions propagate unchanged. Closures are called directly; invokable class names are resolved through the container on each evaluation. Function names, controller strings, arrays, arbitrary method guessing, and non-invokable classes are rejected.
+
+Ability names are case-sensitive exact names containing letters, numbers, dots, underscores, colons, or hyphens. Wildcards and surrounding whitespace are rejected. A duplicate definition throws `AuthorizationDefinitionException`; an undefined ability throws `AbilityNotDefinedException` before resolving the user. There is deliberately no replacement API.
+
+`AuthorizationGate` owns a `Guard`, so the example uses `bind()` rather than a process-wide singleton. In a long-running worker, create a fresh guard and gate for each request. Ability definitions should be application configuration and should not capture request-specific users or mutable request data. The gate stores definitions only, resolves the actor for every decision through the guard, and keeps no static or global authorization state.
+
+Deliberately omitted from this foundation are roles, permission tables, persistence adapters, policies, route-model binding, authorization middleware, controller helpers, template directives, ability discovery, wildcard abilities, before/after hooks, and magic administrator or super-user bypasses.
 
 ## CSRF protection
 
@@ -669,10 +796,10 @@ Or attach middleware to one route:
 ```php
 $router
     ->get('/account', $accountHandler)
-    ->middleware(new RequireAuthentication());
+    ->middleware($requireAuthentication);
 ```
 
-Middleware must return a `Response`. It may short-circuit the pipeline without calling `$next`, which is useful for authentication, authorization, maintenance mode, CORS preflight, and rate limiting. Exceptions thrown anywhere in the pipeline are rendered by Meulah's configured exception handler.
+Middleware must return a `ResponseInterface`. It may short-circuit the pipeline without calling `$next`, which is useful for authentication, authorization, maintenance mode, CORS preflight, and rate limiting. Exceptions thrown anywhere in the pipeline are rendered by Meulah's configured exception handler.
 
 ## Events
 

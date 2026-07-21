@@ -8,9 +8,18 @@ use Meulah\Auth\InvalidAuthenticatableException;
 use Meulah\Auth\NativePasswordHasher;
 use Meulah\Auth\PasswordHasher;
 use Meulah\Auth\PasswordHashingException;
+use Meulah\Auth\RequireAuthentication;
+use Meulah\Auth\RequireGuest;
 use Meulah\Auth\SessionGuard;
 use Meulah\Auth\UserProvider;
 use Meulah\Application;
+use Meulah\Authorization\AbilityNotDefinedException;
+use Meulah\Authorization\AuthorizationCallbackException;
+use Meulah\Authorization\AuthorizationDefinitionException;
+use Meulah\Authorization\AuthorizationException;
+use Meulah\Authorization\AuthorizationGate;
+use Meulah\Authorization\AuthorizationResult;
+use Meulah\Authorization\Gate;
 use Meulah\Container\BindingResolutionException;
 use Meulah\Container\Container;
 use Meulah\Config\Repository;
@@ -66,6 +75,7 @@ use Meulah\Validation\Validator;
 use Meulah\View\View;
 use Tests\Fixtures\CircularOne;
 use Tests\Fixtures\ChildEvent;
+use Tests\Fixtures\AuthorizationCallLog;
 use Tests\Fixtures\FakeAuthenticatable;
 use Tests\Fixtures\FakeUserProvider;
 use Tests\Fixtures\EventLog;
@@ -76,6 +86,7 @@ use Tests\Fixtures\InvokableGreetingController;
 use Tests\Fixtures\MutableEvent;
 use Tests\Fixtures\ParentEvent;
 use Tests\Fixtures\ScalarDependencyController;
+use Tests\Fixtures\OwnsRecordAbility;
 use Tests\Fixtures\SendWelcomeEmail;
 use Tests\Fixtures\UserRegistered;
 
@@ -90,6 +101,7 @@ $test = static function (string $name, Closure $callback) use (&$tests): void {
     $tests[$name] = $callback;
 };
 
+require __DIR__ . '/fixtures/AuthorizationFixtures.php';
 $assertSame = static function (mixed $expected, mixed $actual): void {
     if ($expected !== $actual) {
         throw new RuntimeException(sprintf(
@@ -844,6 +856,505 @@ $test('password hasher is safely shared through the container', static function 
 
     $assertSame($hasher, $container->get(PasswordHasher::class));
     $assertSame(true, $hasher->verify('container password', $hasher->hash('container password')));
+});
+
+$test('authentication middleware allows a resolved user without repeated hydration', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $provider = new FakeUserProvider();
+    $user = new FakeAuthenticatable('account-user');
+    $provider->add($user);
+    $session->put('_auth_user', 'account-user');
+    $guard = new SessionGuard($session, $provider, '_auth_user');
+    $handlerCalls = 0;
+    $middleware = new RequireAuthentication(
+        $guard,
+        static function (): ResponseInterface {
+            throw new RuntimeException('Authenticated request used the rejection callback.');
+        },
+    );
+    $router = new Router();
+
+    $router->group(['middleware' => [$middleware]], static function (Router $router) use (&$handlerCalls): void {
+        $router->get('/account', static function (Request $request) use (&$handlerCalls): string {
+            $handlerCalls++;
+            return $request->string('section');
+        });
+    });
+
+    $request = new Request('GET', '/account', ['section' => 'profile']);
+    $response = $router->dispatch($request);
+
+    $assertSame('profile', $response->content());
+    $assertSame(1, $handlerCalls);
+    $assertSame(['account-user'], $provider->retrieved);
+    $assertSame(['section' => 'profile'], $request->allInput());
+});
+
+$test('authentication middleware uses explicit browser and API responses', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $guard = new SessionGuard($session, new FakeUserProvider(), '_auth_user');
+    $handlerCalls = 0;
+    $browser = new RequireAuthentication(
+        $guard,
+        static function (Request $request): ResponseInterface {
+            return Response::redirect('/sign-in?next=' . rawurlencode($request->path()));
+        },
+    );
+    $browserRouter = new Router();
+    $browserRouter->get('/private', static function () use (&$handlerCalls): string {
+        $handlerCalls++;
+        return 'private';
+    })->middleware($browser);
+
+    $browserResponse = $browserRouter->dispatch(new Request(
+        'GET',
+        '/private',
+        headers: ['Accept' => 'application/json'],
+    ));
+
+    $assertSame(302, $browserResponse->status());
+    $assertSame('/sign-in?next=%2Fprivate', $browserResponse->headers()['Location']);
+    $assertSame(0, $handlerCalls);
+
+    $api = new RequireAuthentication(
+        $guard,
+        static fn (): ResponseInterface => Response::json(
+            ['error' => ['code' => 'unauthenticated']],
+            401,
+        ),
+    );
+    $apiRouter = new Router();
+    $apiRouter->get('/api/private', static fn (): string => 'private')->middleware($api);
+    $apiResponse = $apiRouter->dispatch(new Request(
+        'GET',
+        '/api/private',
+        headers: ['Content-Type' => 'application/json'],
+        rawBody: '{}',
+    ));
+
+    $assertSame(401, $apiResponse->status());
+    $assertSame('application/json; charset=UTF-8', $apiResponse->headers()['Content-Type']);
+    $assertSame(
+        ['error' => ['code' => 'unauthenticated']],
+        json_decode($apiResponse->content(), true, 512, JSON_THROW_ON_ERROR),
+    );
+});
+
+$test('authentication middleware treats stale users as guests without removing identifiers', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $session->put('_auth_user', 'deleted-user');
+    $provider = new FakeUserProvider();
+    $guard = new SessionGuard($session, $provider, '_auth_user');
+    $middleware = new RequireAuthentication(
+        $guard,
+        static fn (): ResponseInterface => new Response('', 401),
+    );
+    $router = new Router();
+    $router->get('/account', static fn (): string => 'account')->middleware($middleware);
+
+    $response = $router->dispatch(new Request('GET', '/account'));
+
+    $assertSame(401, $response->status());
+    $assertSame(['deleted-user'], $provider->retrieved);
+    $assertSame('deleted-user', $session->data['_auth_user']);
+});
+
+$test('guest middleware allows guests and explicitly redirects authenticated users', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $guard = new SessionGuard($session, new FakeUserProvider(), '_auth_user');
+    $middleware = new RequireGuest(
+        $guard,
+        static fn (): ResponseInterface => Response::redirect('/welcome'),
+    );
+    $router = new Router();
+    $handlerCalls = 0;
+    $router->get('/sign-up', static function () use (&$handlerCalls): string {
+        $handlerCalls++;
+        return 'sign up';
+    })->middleware($middleware);
+
+    $guestResponse = $router->dispatch(new Request('GET', '/sign-up'));
+    $guard->login(new FakeAuthenticatable('existing-user'));
+    $authenticatedResponse = $router->dispatch(new Request('GET', '/sign-up'));
+
+    $assertSame('sign up', $guestResponse->content());
+    $assertSame(302, $authenticatedResponse->status());
+    $assertSame('/welcome', $authenticatedResponse->headers()['Location']);
+    $assertSame(1, $handlerCalls);
+});
+
+$test('authentication middleware propagates provider failures', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $session->put('_auth_user', 'provider-user');
+    $provider = new class implements UserProvider {
+        public function retrieveById(string $identifier): ?Authenticatable
+        {
+            throw new DomainException('identity provider unavailable');
+        }
+    };
+    $callbackCalled = false;
+    $middleware = new RequireAuthentication(
+        new SessionGuard($session, $provider, '_auth_user'),
+        static function () use (&$callbackCalled): ResponseInterface {
+            $callbackCalled = true;
+            return new Response('', 401);
+        },
+    );
+    $router = new Router();
+    $router->get('/account', static fn (): string => 'account')->middleware($middleware);
+
+    try {
+        $router->dispatch(new Request('GET', '/account'));
+        throw new RuntimeException('Expected identity provider failure.');
+    } catch (DomainException $exception) {
+        $assertSame('identity provider unavailable', $exception->getMessage());
+    }
+
+    $assertSame(false, $callbackCalled);
+});
+
+$test('authentication middleware composes through nested groups before invokable controllers', static function () use ($assertSame, $sessionFactory): void {
+    $events = new ArrayObject();
+    $session = $sessionFactory();
+    $session->put('_auth_user', 'nested-user');
+    $user = new FakeAuthenticatable('nested-user');
+    $provider = new class($user, $events) implements UserProvider {
+        public function __construct(
+            private readonly Authenticatable $user,
+            private readonly ArrayObject $events,
+        ) {
+        }
+
+        public function retrieveById(string $identifier): ?Authenticatable
+        {
+            $this->events[] = 'auth:check';
+            return $this->user;
+        }
+    };
+    $guard = new SessionGuard($session, $provider, '_auth_user');
+    $authentication = new RequireAuthentication(
+        $guard,
+        static fn (): ResponseInterface => new Response('', 401),
+    );
+    $record = static function (string $name) use ($events): Middleware {
+        return new class($name, $events) implements Middleware {
+            public function __construct(
+                private readonly string $name,
+                private readonly ArrayObject $events,
+            ) {
+            }
+
+            public function process(Request $request, RequestHandler $next): ResponseInterface
+            {
+                $this->events[] = $this->name . ':before';
+                $response = $next->handle($request);
+                $this->events[] = $this->name . ':after';
+                return $response;
+            }
+        };
+    };
+    $router = new Router();
+    $router->container()->singleton(Greeting::class, FriendlyGreeting::class);
+
+    $router->group([
+        'prefix' => '/members',
+        'middleware' => [$record('outer'), $authentication],
+    ], static function (Router $router) use ($record): void {
+        $router->group([
+            'middleware' => [$record('inner')],
+        ], static function (Router $router): void {
+            $router->get('/hello', InvokableGreetingController::class);
+        });
+    });
+
+    $response = $router->dispatch(new Request('GET', '/members/hello', ['name' => 'Ada']));
+
+    $assertSame('Hello, Ada!', $response->content());
+    $assertSame(
+        ['outer:before', 'auth:check', 'inner:before', 'inner:after', 'outer:after'],
+        (array) $events,
+    );
+});
+
+$test('authentication middleware preserves HEAD semantics', static function () use ($assertSame, $sessionFactory): void {
+    $middleware = new RequireAuthentication(
+        new SessionGuard($sessionFactory(), new FakeUserProvider(), '_auth_user'),
+        static fn (): ResponseInterface => Response::html('Not authenticated', 401),
+    );
+    $router = new Router();
+    $router->get('/account', static fn (): string => 'secret')->middleware($middleware);
+
+    $response = $router->dispatch(new Request('HEAD', '/account'));
+
+    $assertSame(401, $response->status());
+    $assertSame('', $response->content());
+    $assertSame('text/html; charset=UTF-8', $response->headers()['Content-Type']);
+});
+
+$authorizationGateFactory = static function (
+    ?Authenticatable $user = null,
+    ?Container $container = null,
+) use ($sessionFactory): AuthorizationGate {
+    $guard = new SessionGuard($sessionFactory(), new FakeUserProvider(), '_auth_user');
+
+    if ($user !== null) {
+        $guard->login($user);
+    }
+
+    return new AuthorizationGate($guard, $container ?? new Container());
+};
+
+$test('authorization results are immutable explicit decisions', static function () use ($assertSame): void {
+    $allowed = AuthorizationResult::allow();
+    $denied = AuthorizationResult::deny('Record access denied.', 'record_denied');
+
+    $assertSame(true, $allowed->allowed());
+    $assertSame(false, $allowed->denied());
+    $assertSame(null, $allowed->message());
+    $assertSame(null, $allowed->code());
+    $assertSame(false, $denied->allowed());
+    $assertSame(true, $denied->denied());
+    $assertSame('Record access denied.', $denied->message());
+    $assertSame('record_denied', $denied->code());
+});
+
+$test('authorization gate evaluates authenticated actors and multiple arguments', static function () use ($assertSame, $authorizationGateFactory): void {
+    $gate = $authorizationGateFactory(new FakeAuthenticatable('actor-42'));
+    $gate->define(
+        'records.update:v1',
+        static function (
+            Authenticatable $actor,
+            string $ownerIdentifier,
+            int $expectedVersion,
+            int $actualVersion,
+        ): bool {
+            return $actor->authIdentifier() === $ownerIdentifier
+                && $expectedVersion === $actualVersion;
+        },
+    );
+
+    $assertSame(true, $gate->allows('records.update:v1', 'actor-42', 7, 7));
+    $assertSame(false, $gate->denies('records.update:v1', 'actor-42', 7, 7));
+    $assertSame(false, $gate->allows('records.update:v1', 'other', 7, 7));
+    $assertSame(true, $gate->denies('records.update:v1', 'actor-42', 7, 8));
+    $gate->authorize('records.update:v1', 'actor-42', 7, 7);
+});
+
+$test('authorization denial preserves safe context without exposing it automatically', static function () use ($assertSame, $authorizationGateFactory): void {
+    $gate = $authorizationGateFactory(new FakeAuthenticatable('actor'));
+    $denial = AuthorizationResult::deny('Sensitive business explanation.', 'ownership_failed');
+    $gate->define(
+        'records.delete',
+        static fn (Authenticatable $actor): AuthorizationResult => $denial,
+    );
+
+    $assertSame($denial, $gate->inspect('records.delete'));
+
+    try {
+        $gate->authorize('records.delete');
+        throw new RuntimeException('Expected authorization denial.');
+    } catch (AuthorizationException $exception) {
+        $assertSame('This action is not authorized.', $exception->getMessage());
+        $assertSame(false, str_contains($exception->getMessage(), 'Sensitive'));
+        $assertSame('records.delete', $exception->ability());
+        $assertSame($denial, $exception->result());
+    }
+});
+
+$test('authorization definitions reject missing duplicate wildcard and unstable abilities', static function () use ($assertSame, $sessionFactory): void {
+    $provider = new class implements UserProvider {
+        public int $calls = 0;
+
+        public function retrieveById(string $identifier): ?Authenticatable
+        {
+            $this->calls++;
+            return new FakeAuthenticatable($identifier);
+        }
+    };
+    $session = $sessionFactory();
+    $session->put('_auth_user', 'actor');
+    $gate = new AuthorizationGate(
+        new SessionGuard($session, $provider, '_auth_user'),
+        new Container(),
+    );
+
+    try {
+        $gate->inspect('missing');
+        throw new RuntimeException('Expected missing ability failure.');
+    } catch (AbilityNotDefinedException $exception) {
+        $assertSame("Authorization ability 'missing' is not defined.", $exception->getMessage());
+    }
+
+    $assertSame(0, $provider->calls);
+    $gate->define('stable-ability', static fn (Authenticatable $actor): bool => true);
+
+    try {
+        $gate->define('stable-ability', static fn (Authenticatable $actor): bool => false);
+        throw new RuntimeException('Expected duplicate ability failure.');
+    } catch (AuthorizationDefinitionException $exception) {
+        $assertSame(
+            "Authorization ability 'stable-ability' is already defined.",
+            $exception->getMessage(),
+        );
+    }
+
+    $assertSame(true, $gate->allows('stable-ability'));
+
+    foreach (['', ' leading', 'trailing ', 'records.*', '*'] as $invalidAbility) {
+        try {
+            $gate->define($invalidAbility, static fn (Authenticatable $actor): bool => true);
+            throw new RuntimeException('Expected invalid ability name failure.');
+        } catch (AuthorizationDefinitionException $exception) {
+            $assertSame(
+                'Authorization ability names must be non-empty exact names without whitespace or wildcards.',
+                $exception->getMessage(),
+            );
+        }
+    }
+});
+
+$test('authorization guest access is explicit in the actor parameter', static function () use ($assertSame, $authorizationGateFactory): void {
+    $gate = $authorizationGateFactory();
+    $authenticatedOnlyCalls = 0;
+    $guestAwareCalls = 0;
+    $gate->define(
+        'account.view',
+        static function (Authenticatable $actor) use (&$authenticatedOnlyCalls): bool {
+            $authenticatedOnlyCalls++;
+            return true;
+        },
+    );
+    $gate->define(
+        'article.view',
+        static function (?Authenticatable $actor, bool $published) use (&$guestAwareCalls): bool {
+            $guestAwareCalls++;
+            return $published || $actor !== null;
+        },
+    );
+
+    $assertSame(true, $gate->denies('account.view'));
+    $assertSame(0, $authenticatedOnlyCalls);
+    $assertSame(true, $gate->allows('article.view', true));
+    $assertSame(false, $gate->allows('article.view', false));
+    $assertSame(2, $guestAwareCalls);
+
+    $authenticated = $authorizationGateFactory(new FakeAuthenticatable('reader'));
+    $authenticated->define(
+        'article.view',
+        static fn (?Authenticatable $actor, bool $published): bool => $published || $actor !== null,
+    );
+    $assertSame(true, $authenticated->allows('article.view', false));
+});
+
+$test('authorization callbacks reject unsupported definitions and return values', static function () use ($assertSame, $authorizationGateFactory): void {
+    $gate = $authorizationGateFactory(new FakeAuthenticatable('actor'));
+
+    foreach ([
+        'strlen',
+        stdClass::class,
+        static fn (): bool => true,
+        static fn (string $actor): bool => true,
+    ] as $index => $callback) {
+        try {
+            $gate->define('invalid-' . $index, $callback);
+            throw new RuntimeException('Expected invalid authorization callback rejection.');
+        } catch (AuthorizationDefinitionException $exception) {
+            $assertSame(true, str_starts_with($exception->getMessage(), 'Authorization'));
+        }
+    }
+
+    $gate->define('invalid-result', static fn (Authenticatable $actor): int => 1);
+
+    try {
+        $gate->inspect('invalid-result');
+        throw new RuntimeException('Expected invalid authorization return rejection.');
+    } catch (AuthorizationCallbackException $exception) {
+        $assertSame(
+            "Authorization ability 'invalid-result' must return bool or AuthorizationResult; int returned.",
+            $exception->getMessage(),
+        );
+    }
+
+    $gate->define('throws', static function (Authenticatable $actor): bool {
+        throw new DomainException('authorization dependency failed');
+    });
+
+    try {
+        $gate->inspect('throws');
+        throw new RuntimeException('Expected authorization callback failure.');
+    } catch (DomainException $exception) {
+        $assertSame('authorization dependency failed', $exception->getMessage());
+    }
+});
+
+$test('authorization gate resolves invokable classes through the container', static function () use ($assertSame, $authorizationGateFactory): void {
+    $container = new Container();
+    $log = new AuthorizationCallLog();
+    $container->instance(AuthorizationCallLog::class, $log);
+    $gate = $authorizationGateFactory(new FakeAuthenticatable('owner-9'), $container);
+    $gate->define('record.update', OwnsRecordAbility::class);
+
+    $assertSame(true, $gate->allows('record.update', 'owner-9', 'record-a'));
+    $denied = $gate->inspect('record.update', 'other-owner', 'record-b');
+
+    $assertSame(true, $denied->denied());
+    $assertSame('The record is owned by another user.', $denied->message());
+    $assertSame('not_owner', $denied->code());
+    $assertSame(['record-a', 'record-b'], $log->entries);
+});
+
+$test('authorization gate does not retain actors across long-running reuse', static function () use ($assertSame, $sessionFactory, $authorizationGateFactory): void {
+    $session = $sessionFactory();
+    $guard = new SessionGuard($session, new FakeUserProvider(), '_auth_user');
+    $gate = new AuthorizationGate($guard, new Container());
+    $gate->define(
+        'identity.matches',
+        static fn (?Authenticatable $actor, string $expected): bool =>
+            $actor?->authIdentifier() === $expected,
+    );
+
+    $assertSame(false, $gate->allows('identity.matches', 'alpha'));
+    $guard->login(new FakeAuthenticatable('alpha'));
+    $assertSame(true, $gate->allows('identity.matches', 'alpha'));
+    $guard->login(new FakeAuthenticatable('beta'));
+    $assertSame(false, $gate->allows('identity.matches', 'alpha'));
+    $assertSame(true, $gate->allows('identity.matches', 'beta'));
+    $session->invalidate();
+    $assertSame(false, $gate->allows('identity.matches', 'beta'));
+
+    $alpha = $authorizationGateFactory(new FakeAuthenticatable('alpha'));
+    $beta = $authorizationGateFactory(new FakeAuthenticatable('beta'));
+    $ability = static fn (Authenticatable $actor, string $expected): bool =>
+        $actor->authIdentifier() === $expected;
+    $alpha->define('identity.matches', $ability);
+    $beta->define('identity.matches', $ability);
+
+    $assertSame(true, $alpha->allows('identity.matches', 'alpha'));
+    $assertSame(false, $beta->allows('identity.matches', 'alpha'));
+});
+
+$test('authorization gate composes through a transient container binding', static function () use ($assertSame, $sessionFactory): void {
+    $guard = new SessionGuard($sessionFactory(), new FakeUserProvider(), '_auth_user');
+    $guard->login(new FakeAuthenticatable('container-actor'));
+    $container = new Container();
+    $container->instance(Guard::class, $guard);
+    $container->bind(Gate::class, static function (Container $container): Gate {
+        $gate = new AuthorizationGate($container->get(Guard::class), $container);
+        $gate->define(
+            'container.check',
+            static fn (Authenticatable $actor): bool =>
+                $actor->authIdentifier() === 'container-actor',
+        );
+        return $gate;
+    });
+
+    $first = $container->get(Gate::class);
+    $second = $container->get(Gate::class);
+
+    $assertSame(true, $first instanceof AuthorizationGate);
+    $assertSame(false, $first === $second);
+    $assertSame(true, $first->allows('container.check'));
+    $assertSame(true, $second->allows('container.check'));
 });
 $test('CSRF validation does not create session state for missing tokens', static function () use ($assertSame, $sessionFactory): void {
     $session = $sessionFactory();
