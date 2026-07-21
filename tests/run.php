@@ -2,6 +2,11 @@
 
 declare(strict_types=1);
 
+use Meulah\Auth\Authenticatable;
+use Meulah\Auth\Guard;
+use Meulah\Auth\InvalidAuthenticatableException;
+use Meulah\Auth\SessionGuard;
+use Meulah\Auth\UserProvider;
 use Meulah\Application;
 use Meulah\Container\BindingResolutionException;
 use Meulah\Container\Container;
@@ -58,6 +63,8 @@ use Meulah\Validation\Validator;
 use Meulah\View\View;
 use Tests\Fixtures\CircularOne;
 use Tests\Fixtures\ChildEvent;
+use Tests\Fixtures\FakeAuthenticatable;
+use Tests\Fixtures\FakeUserProvider;
 use Tests\Fixtures\EventLog;
 use Tests\Fixtures\FriendlyGreeting;
 use Tests\Fixtures\Greeting;
@@ -72,6 +79,7 @@ use Tests\Fixtures\UserRegistered;
 require __DIR__ . '/bootstrap.php';
 require __DIR__ . '/fixtures/EventFixtures.php';
 require __DIR__ . '/fixtures/ContainerFixtures.php';
+require __DIR__ . '/fixtures/AuthenticationFixtures.php';
 
 $tests = [];
 
@@ -406,6 +414,161 @@ $test('session middleware closes sessions when downstream handling fails', stati
     $assertSame(1, $session->closeCount);
     $assertSame(false, $session->isStarted());
 });
+$test('session guard represents ordinary guest state without consulting the provider', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $provider = new FakeUserProvider();
+    $guard = new SessionGuard($session, $provider);
+
+    $assertSame(null, $guard->user());
+    $assertSame(null, $guard->id());
+    $assertSame(false, $guard->check());
+    $assertSame(true, $guard->guest());
+    $assertSame([], $provider->retrieved);
+});
+
+$test('session guard login and logout rotate identifiers without storing user objects', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $session->put('cart', ['book']);
+    $provider = new FakeUserProvider();
+    $guard = new SessionGuard($session, $provider);
+    $user = new FakeAuthenticatable('00042');
+    $beforeLogin = $session->id();
+
+    $guard->login($user);
+
+    $afterLogin = $session->id();
+    $assertSame(false, $beforeLogin === $afterLogin);
+    $assertSame('00042', $session->data['__meulah_auth_identifier']);
+    $assertSame(false, $session->data['__meulah_auth_identifier'] instanceof Authenticatable);
+    $assertSame($user, $guard->user());
+    $assertSame('00042', $guard->id());
+    $assertSame(true, $guard->check());
+    $assertSame(false, $guard->guest());
+    $assertSame(['book'], $session->data['cart']);
+    $assertSame([], $provider->retrieved);
+
+    $guard->logout();
+
+    $assertSame(false, $afterLogin === $session->id());
+    $assertSame(false, array_key_exists('__meulah_auth_identifier', $session->data));
+    $assertSame(['book'], $session->data['cart']);
+    $assertSame(null, $guard->user());
+    $assertSame(null, $guard->id());
+    $assertSame(true, $guard->guest());
+});
+
+$test('session guard restores exact edge-case string identifiers and refreshes across session lifecycle changes', static function () use ($assertSame, $sessionFactory): void {
+    foreach (['0', '00042', '??:?', ' spaced '] as $identifier) {
+        $session = $sessionFactory();
+        $provider = new FakeUserProvider();
+        $user = new FakeAuthenticatable($identifier);
+        $provider->add($user);
+        $session->put('__meulah_auth_identifier', $identifier);
+        $guard = new SessionGuard($session, $provider);
+
+        $assertSame($user, $guard->user());
+        $assertSame($identifier, $guard->id());
+        $assertSame([$identifier], $provider->retrieved);
+        $assertSame($user, $guard->user());
+        $assertSame([$identifier], $provider->retrieved);
+
+        $session->regenerate();
+        $assertSame($user, $guard->user());
+        $assertSame([$identifier, $identifier], $provider->retrieved);
+
+        $session->invalidate();
+        $assertSame(null, $guard->user());
+        $assertSame(null, $guard->id());
+        $assertSame([$identifier, $identifier], $provider->retrieved);
+    }
+});
+
+$test('session guard rejects malformed stored and application identifiers without scalar guessing', static function () use ($assertSame, $sessionFactory): void {
+    foreach ([null, 0, false, '', []] as $identifier) {
+        $session = $sessionFactory();
+        $session->put('__meulah_auth_identifier', $identifier);
+        $provider = new FakeUserProvider();
+        $guard = new SessionGuard($session, $provider);
+
+        try {
+            $guard->user();
+            throw new RuntimeException('Expected malformed stored identifier rejection.');
+        } catch (InvalidAuthenticatableException $exception) {
+            $assertSame(
+                'Stored authentication identifiers must be non-empty strings.',
+                $exception->getMessage(),
+            );
+        }
+
+        $assertSame([], $provider->retrieved);
+    }
+
+    try {
+        (new SessionGuard($sessionFactory(), new FakeUserProvider()))
+            ->login(new FakeAuthenticatable(''));
+        throw new RuntimeException('Expected empty application identifier rejection.');
+    } catch (InvalidAuthenticatableException $exception) {
+        $assertSame(
+            'Authenticatable authentication identifiers must be non-empty strings.',
+            $exception->getMessage(),
+        );
+    }
+});
+
+$test('session guard treats missing users as guests and rejects provider identifier mismatches', static function () use ($assertSame, $sessionFactory): void {
+    $missingSession = $sessionFactory();
+    $missingSession->put('__meulah_auth_identifier', 'deleted-user');
+    $missingProvider = new FakeUserProvider();
+    $missingGuard = new SessionGuard($missingSession, $missingProvider);
+
+    $assertSame(null, $missingGuard->user());
+    $assertSame(null, $missingGuard->id());
+    $assertSame(true, $missingGuard->guest());
+    $assertSame(['deleted-user'], $missingProvider->retrieved);
+    $assertSame('deleted-user', $missingSession->data['__meulah_auth_identifier']);
+
+    $mismatchSession = $sessionFactory();
+    $mismatchSession->put('__meulah_auth_identifier', 'secret-expected-91');
+    $mismatchProvider = new FakeUserProvider();
+    $mismatchProvider->add(new FakeAuthenticatable('secret-actual-27'), 'secret-expected-91');
+    $mismatchGuard = new SessionGuard($mismatchSession, $mismatchProvider);
+
+    try {
+        $mismatchGuard->user();
+        throw new RuntimeException('Expected mismatched provider identity rejection.');
+    } catch (InvalidAuthenticatableException $exception) {
+        $assertSame(
+            'The user provider returned an Authenticatable with a different authentication identifier.',
+            $exception->getMessage(),
+        );
+        $assertSame(false, str_contains($exception->getMessage(), 'secret-expected-91'));
+        $assertSame(false, str_contains($exception->getMessage(), 'secret-actual-27'));
+    }
+});
+
+$test('authentication contracts compose through explicit container bindings', static function () use ($assertSame, $sessionFactory): void {
+    $container = new Container();
+    $session = $sessionFactory();
+    $provider = new FakeUserProvider();
+    $user = new FakeAuthenticatable('container-user');
+    $container->instance(Session::class, $session);
+    $container->instance(UserProvider::class, $provider);
+    $container->singleton(Guard::class, SessionGuard::class);
+
+    $guard = $container->get(Guard::class);
+    $assertSame(true, $guard instanceof SessionGuard);
+    $assertSame($guard, $container->get(Guard::class));
+    $guard->login($user);
+    $assertSame('container-user', $guard->id());
+
+    try {
+        $container->get(Authenticatable::class);
+        throw new RuntimeException('Expected application identity binding requirement.');
+    } catch (BindingResolutionException $exception) {
+        $assertSame(true, str_contains($exception->getMessage(), 'register an explicit binding'));
+    }
+});
+
 $test('CSRF validation does not create session state for missing tokens', static function () use ($assertSame, $sessionFactory): void {
     $session = $sessionFactory();
     $csrf = new Csrf($session);

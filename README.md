@@ -309,6 +309,73 @@ Secure cookies remain the default. Production should use HTTPS, `secure: true`, 
 
 Only the native PHP driver exists in this milestone. Its persistence is controlled by PHP's configured session save handler. File, database, and Redis drivers remain future adapters behind the same `Session` contract.
 
+## Authentication contracts
+
+Meulah provides model-agnostic authentication contracts and one session-backed guard. It does not provide a User model, table layout, credential fields, password hashing workflow, or ORM-backed provider.
+
+An application identity implements only `Authenticatable`:
+
+```php
+use Meulah\Auth\Authenticatable;
+
+final class User implements Authenticatable
+{
+    public function __construct(
+        public readonly int $id,
+        public readonly string $email,
+    ) {
+    }
+
+    public function authIdentifier(): string
+    {
+        return (string) $this->id;
+    }
+}
+```
+
+Authentication identifiers are deliberately non-empty strings. Session serialization therefore preserves identifiers such as `"0"`, `"00042"`, UUIDs, and Unicode identifiers without guessing an integer width or silently changing representation. Applications with integer primary keys cast them explicitly at their boundary. Meulah does not trim or otherwise normalize identifiers.
+
+The first `UserProvider` contract restores only by that stable identifier:
+
+```php
+use Meulah\Auth\Authenticatable;
+use Meulah\Auth\UserProvider;
+
+final class ApplicationUserProvider implements UserProvider
+{
+    public function retrieveById(string $identifier): ?Authenticatable
+    {
+        // Query an application repository and return its User, or null.
+    }
+}
+```
+
+Meulah does not provide an ORM-backed implementation because table names, key types, tenancy, soft deletion, persistence libraries, and identity lifecycles are application policy. The contract works equally with an ORM, PDO-backed repository, remote service, or in-memory fake.
+
+Credential lookup and password verification do not belong in this contract yet. Adding `retrieveByCredentials()` would prematurely define credential-field and secret-handling conventions before an `attempt()` workflow exists. Applications remain free to build an explicit login service around their own repository and password hasher, then pass the verified identity to `Guard::login()`.
+
+Bind the application provider, the request's session, and the guard explicitly:
+
+```php
+use Meulah\Auth\Guard;
+use Meulah\Auth\SessionGuard;
+use Meulah\Auth\UserProvider;
+use Meulah\Session\Session;
+
+$container = $app->container();
+$container->instance(Session::class, $session);
+$container->singleton(UserProvider::class, ApplicationUserProvider::class);
+$container->singleton(Guard::class, SessionGuard::class);
+
+$guard = $container->get(Guard::class);
+```
+
+`SessionGuard` stores only the string identifier, never the entire user object. `user()` restores lazily through the provider; a missing record is ordinary guest state. Invalid stored identifiers or a provider returning a different identifier throw `InvalidAuthenticatableException` without exposing either value. The in-memory result is tied to the current session ID, so session regeneration, invalidation, or request reuse causes authentication state to be resolved again.
+
+`login()` rotates the session ID before storing the identifier. `logout()` removes only authentication state, rotates the session ID, and preserves unrelated session data. Because CSRF tokens are bound to the session ID, both transitions also make the previous CSRF token stale. Applications should bind one guard per request; there is no global or static authentication state.
+
+No authentication manager is included because Meulah currently has one guard type and no demonstrated named-guard requirement. Also postponed are `attempt()`, credential validation, password hash contracts, authentication middleware, unauthenticated HTTP exceptions, login or registration controllers, remember-me cookies, authorization, API tokens, OAuth, and JWT.
+
 ## CSRF protection
 
 Session-backed forms must register CSRF middleware globally. Use the same session instance for the form helper and middleware:
