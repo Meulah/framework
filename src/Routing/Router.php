@@ -214,7 +214,15 @@ final class Router
                     $this->invokeHandler($handler, $request, $parameters),
                 ),
             );
-            $response = (new MiddlewarePipeline($route->middlewareStack(), $destination))->handle($request);
+            $routeParameters = new RouteParameters($parameters);
+            $middleware = array_map(
+                static fn (Middleware $middleware): Middleware =>
+                    $middleware instanceof RouteParameterAwareMiddleware
+                        ? $middleware->withRouteParameters($routeParameters)
+                        : $middleware,
+                $route->middlewareStack(),
+            );
+            $response = (new MiddlewarePipeline($middleware, $destination))->handle($request);
 
             return $request->method() === 'HEAD' ? $response->withoutBody() : $response;
         }

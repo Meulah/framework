@@ -312,6 +312,8 @@ Only the native PHP driver exists in this milestone. Its persistence is controll
 ## Authentication contracts
 
 Meulah provides model-agnostic authentication contracts and one session-backed guard. It does not provide a User model, table layout, credential fields, password hashing workflow, or ORM-backed provider.
+See the [complete authentication and authorization integration guide](docs/authentication.md) for an application User, credential provider, request-scoped container setup, login and logout actions, middleware, Gate definitions, CSRF wiring, worker lifecycle rules, and intentionally omitted features.
+
 
 An application identity implements only `Authenticatable`:
 
@@ -388,7 +390,7 @@ A provider returning `null` is ordinary guest state: `user()` and `id()` return 
 
 `logout()` clears cached identity, removes only the configured authentication key, and rotates the session ID. It does not invalidate the whole session or destroy unrelated data. Because Meulah's CSRF token is bound to the session ID, both login and logout make the previous token stale; the next CSRF token access creates a replacement. If an application needs to destroy all session data, it explicitly calls `Session::invalidate()` in its logout workflow.
 
-`SessionGuard` is transient and intended to live for one request. Meulah's container has singleton and transient bindings but no request scope, and an `Application` can survive multiple requests in a long-running worker. The example therefore uses `bind()`, not `singleton()`. A singleton is safe only when the application and container are guaranteed to be rebuilt for every request. Long-running workers must create a fresh session and guard per request and must not capture either in process-global state. The cache is also tied to the current session ID, so regeneration or invalidation forces re-resolution as a defensive backstop.
+`SessionGuard` is transient and intended to live for one request. Meulah's container has singleton and transient bindings but no request scope, and an `Application` can survive multiple requests in a long-running worker. A singleton is safe only when the application and container are guaranteed to be rebuilt for every request. Long-running workers must rebuild the complete request graph: container, session, guard, gate, router, and the route middleware instances that capture them. Rebinding only `Guard` is insufficient because an existing router retains its registered middleware objects. The guard cache is tied to the current session ID as a defensive backstop, but it is not a replacement for request scoping when one browser legitimately keeps the same session ID across requests.
 
 ### Authentication middleware
 
@@ -551,7 +553,64 @@ Ability names are case-sensitive exact names containing letters, numbers, dots, 
 
 `AuthorizationGate` owns a `Guard`, so the example uses `bind()` rather than a process-wide singleton. In a long-running worker, create a fresh guard and gate for each request. Ability definitions should be application configuration and should not capture request-specific users or mutable request data. The gate stores definitions only, resolves the actor for every decision through the guard, and keeps no static or global authorization state.
 
-Deliberately omitted from this foundation are roles, permission tables, persistence adapters, policies, route-model binding, authorization middleware, controller helpers, template directives, ability discovery, wildcard abilities, before/after hooks, and magic administrator or super-user bypasses.
+### Route authorization
+
+Protect a route with the exact ability name and an explicit ordered argument resolver:
+
+```php
+use Meulah\Authorization\Authorize;
+use Meulah\Http\Request;
+use Meulah\Routing\RouteParameters;
+use Meulah\Routing\Router;
+
+$authorizeUpdateUser = new Authorize(
+    gate: $gate,
+    ability: 'user.update',
+    arguments: static function (
+        Request $request,
+        RouteParameters $parameters,
+    ): array {
+        return [$parameters->require('user')];
+    },
+);
+
+$router->group([
+    'prefix' => '/admin',
+    'middleware' => [
+        $requireAuthentication,
+        $authorizeUpdateUser,
+    ],
+], static function (Router $router): void {
+    $router->patch('/users/{user}', [UserController::class, 'update']);
+});
+```
+
+`RouteParameters` contains the decoded string parameters for the matched route. Its `all()` and `has()` methods support explicit inspection, while `require()` throws `MissingRouteParameterException` when a configured argument is unavailable. This is a configuration error rather than an authorization denial. Meulah does not perform route-model binding or persistence queries; the application decides which strings or already-available application objects to pass to the gate.
+
+The argument resolver must return a list in callback argument order. Associative arrays and non-array values throw `AuthorizationMiddlewareException`; a no-argument ability must deliberately return `[]`. Undefined abilities and exceptions from Gate callbacks propagate through the normal application exception boundary instead of becoming unexplained denials.
+
+Default denials are intentionally generic:
+
+- Browser responses use status 403 with the body `Forbidden.`.
+- Requests recognized by `Request::expectsJson()` receive status 403 and `{"error":{"code":"forbidden","message":"Forbidden."}}`.
+- HEAD denials preserve status and headers but the router removes the body.
+
+The default response never exposes the message or code from `AuthorizationResult`. Applications that have reviewed those values for disclosure may pass the optional `denied` callback to `Authorize`; that callback receives the request and result and must return `ResponseInterface`.
+
+Use this middleware order:
+
+1. `SessionMiddleware`
+2. `RequireAuthentication`
+3. `Authorize`
+4. the controller
+
+For unsafe session-backed requests, global CSRF middleware also runs after the session middleware and before route middleware. `RequireAuthentication` must precede `Authorize` when guests should receive the application's explicit 401 response or authentication redirect. `Authorize` alone treats a denied guest like every other denied actor and returns 403; it never redirects or guesses a login route.
+
+Nested route groups preserve declaration order. The router supplies matched parameters by cloning route-aware middleware for each dispatch, so reusing one `Authorize` definition across routes or requests does not retain another request's parameters in long-running workers.
+
+Method-spoofed requests are authorized against the effective method. The resolver may inspect both `$request->method()` and `$request->originalMethod()` when that distinction is part of an ability. Authorization happens before the controller and does not change request input.
+
+Deliberately omitted from this foundation are roles, permission tables, persistence adapters, policies, route-model binding, controller helpers, template directives, ability discovery, wildcard abilities, before/after hooks, and magic administrator or super-user bypasses.
 
 ## CSRF protection
 

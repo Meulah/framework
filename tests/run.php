@@ -14,10 +14,12 @@ use Meulah\Auth\SessionGuard;
 use Meulah\Auth\UserProvider;
 use Meulah\Application;
 use Meulah\Authorization\AbilityNotDefinedException;
+use Meulah\Authorization\Authorize;
 use Meulah\Authorization\AuthorizationCallbackException;
 use Meulah\Authorization\AuthorizationDefinitionException;
 use Meulah\Authorization\AuthorizationException;
 use Meulah\Authorization\AuthorizationGate;
+use Meulah\Authorization\AuthorizationMiddlewareException;
 use Meulah\Authorization\AuthorizationResult;
 use Meulah\Authorization\Gate;
 use Meulah\Container\BindingResolutionException;
@@ -56,9 +58,11 @@ use Meulah\Http\UploadedFile;
 use Meulah\Http\UploadException;
 use Meulah\Log\Logger;
 use Meulah\Routing\MethodNotAllowed;
+use Meulah\Routing\MissingRouteParameterException;
 use Meulah\Routing\RouteNotFound;
 use Meulah\Routing\RouteDefinitionException;
 use Meulah\Routing\RouteHandlerException;
+use Meulah\Routing\RouteParameters;
 use Meulah\Routing\Router;
 use Meulah\Routing\UrlGenerationException;
 use Meulah\Security\Csrf\Csrf;
@@ -71,6 +75,8 @@ use Meulah\Session\SessionMiddleware;
 use Meulah\Support\Environment;
 use Meulah\Validation\ValidationException;
 use Meulah\Validation\ValidationRuleException;
+use Tests\Fixtures\AuthenticationApplicationFixture;
+use Tests\Fixtures\InMemoryUserProvider;
 use Meulah\Validation\Validator;
 use Meulah\View\View;
 use Tests\Fixtures\CircularOne;
@@ -84,6 +90,7 @@ use Tests\Fixtures\Greeting;
 use Tests\Fixtures\GreetingController;
 use Tests\Fixtures\InvokableGreetingController;
 use Tests\Fixtures\MutableEvent;
+use Tests\Fixtures\TestUser;
 use Tests\Fixtures\ParentEvent;
 use Tests\Fixtures\ScalarDependencyController;
 use Tests\Fixtures\OwnsRecordAbility;
@@ -94,6 +101,7 @@ require __DIR__ . '/bootstrap.php';
 require __DIR__ . '/fixtures/EventFixtures.php';
 require __DIR__ . '/fixtures/ContainerFixtures.php';
 require __DIR__ . '/fixtures/AuthenticationFixtures.php';
+require __DIR__ . '/fixtures/AuthenticationApplicationFixture.php';
 
 $tests = [];
 
@@ -1356,6 +1364,636 @@ $test('authorization gate composes through a transient container binding', stati
     $assertSame(true, $first->allows('container.check'));
     $assertSame(true, $second->allows('container.check'));
 });
+$test('route authorization composes through nested groups in deterministic order', static function () use ($assertSame, $sessionFactory): void {
+    $session = $sessionFactory();
+    $provider = new FakeUserProvider();
+    $actor = new FakeAuthenticatable('actor-7');
+    $provider->add($actor);
+    $guard = new SessionGuard($session, $provider, '_auth_user');
+    $guard->login($actor);
+    $gate = new AuthorizationGate($guard, new Container());
+    $trace = new class {
+        /** @var list<string> */
+        public array $entries = [];
+    };
+    $gate->define(
+        'records.update',
+        static function (
+            Authenticatable $actor,
+            string $record,
+            string $method,
+        ) use ($trace): bool {
+            $trace->entries[] = 'authorize:' . $record . ':' . $method;
+            return $actor->authIdentifier() === 'actor-7';
+        },
+    );
+    $authorization = new Authorize(
+        $gate,
+        'records.update',
+        static function (Request $request, RouteParameters $parameters) use ($trace): array {
+            $trace->entries[] = 'arguments:' . implode(',', array_keys($parameters->all()));
+            return [$parameters->require('record'), $request->method()];
+        },
+    );
+    $wrappingMiddleware = static function (string $name) use ($trace): Middleware {
+        return new class($trace, $name) implements Middleware {
+            public function __construct(
+                private readonly object $trace,
+                private readonly string $name,
+            ) {
+            }
+
+            public function process(Request $request, RequestHandler $next): ResponseInterface
+            {
+                $this->trace->entries[] = $this->name . ':before';
+                $response = $next->handle($request);
+                $this->trace->entries[] = $this->name . ':after';
+                return $response;
+            }
+        };
+    };
+    $router = new Router();
+    $router->group([
+        'prefix' => '/admin',
+        'middleware' => [
+            new RequireAuthentication(
+                $guard,
+                static fn (Request $request): ResponseInterface =>
+                    Response::html('Unauthenticated.', 401),
+            ),
+            $wrappingMiddleware('outer'),
+        ],
+    ], static function (Router $router) use ($authorization, $wrappingMiddleware, $trace): void {
+        $router->group([
+            'prefix' => '/records',
+            'middleware' => [$authorization, $wrappingMiddleware('inner')],
+        ], static function (Router $router) use ($trace): void {
+            $router->get('/{record}', static function (string $record) use ($trace): string {
+                $trace->entries[] = 'controller:' . $record;
+                return 'record:' . $record;
+            });
+        });
+    });
+
+    $assertSame(
+        'record:first',
+        $router->dispatch(new Request('GET', '/admin/records/first'))->content(),
+    );
+    $assertSame(
+        'record:second',
+        $router->dispatch(new Request('GET', '/admin/records/second'))->content(),
+    );
+    $assertSame([
+        'outer:before',
+        'arguments:record',
+        'authorize:first:GET',
+        'inner:before',
+        'controller:first',
+        'inner:after',
+        'outer:after',
+        'outer:before',
+        'arguments:record',
+        'authorize:second:GET',
+        'inner:before',
+        'controller:second',
+        'inner:after',
+        'outer:after',
+    ], $trace->entries);
+});
+
+$test('route authorization returns safe browser JSON and HEAD denials', static function () use ($assertSame, $authorizationGateFactory): void {
+    $gate = $authorizationGateFactory(new FakeAuthenticatable('actor'));
+    $gate->define(
+        'secrets.read',
+        static fn (Authenticatable $actor): AuthorizationResult =>
+            AuthorizationResult::deny('Sensitive ownership details.', 'internal_rule_17'),
+    );
+    $authorization = new Authorize(
+        $gate,
+        'secrets.read',
+        static fn (Request $request, RouteParameters $parameters): array => [],
+    );
+    $router = new Router();
+    $router->get('/secret', static fn (): string => 'secret')->middleware($authorization);
+
+    $browser = $router->dispatch(new Request('GET', '/secret'));
+    $json = $router->dispatch(new Request(
+        'GET',
+        '/secret',
+        headers: ['Accept' => 'application/problem+json'],
+    ));
+    $head = $router->dispatch(new Request('HEAD', '/secret'));
+    $payload = json_decode($json->content(), true, 512, JSON_THROW_ON_ERROR);
+
+    $assertSame(403, $browser->status());
+    $assertSame('Forbidden.', $browser->content());
+    $assertSame('text/html; charset=UTF-8', $browser->headers()['Content-Type']);
+    $assertSame(false, str_contains($browser->content(), 'ownership'));
+    $assertSame(403, $json->status());
+    $assertSame([
+        'error' => ['code' => 'forbidden', 'message' => 'Forbidden.'],
+    ], $payload);
+    $assertSame(false, str_contains($json->content(), 'internal_rule_17'));
+    $assertSame('application/json; charset=UTF-8', $json->headers()['Content-Type']);
+    $assertSame(403, $head->status());
+    $assertSame('', $head->content());
+
+    $custom = new Router();
+    $custom->get('/custom', static fn (): string => 'secret')->middleware(new Authorize(
+        $gate,
+        'secrets.read',
+        static fn (Request $request, RouteParameters $parameters): array => [],
+        static fn (Request $request, AuthorizationResult $result): ResponseInterface =>
+            Response::json(['error' => ['code' => $result->code()]], 403),
+    ));
+    $customPayload = json_decode(
+        $custom->dispatch(new Request('GET', '/custom'))->content(),
+        true,
+        512,
+        JSON_THROW_ON_ERROR,
+    );
+    $assertSame(['error' => ['code' => 'internal_rule_17']], $customPayload);
+});
+
+$test('authentication middleware distinguishes guests before route authorization', static function () use ($assertSame, $sessionFactory): void {
+    $guard = new SessionGuard($sessionFactory(), new FakeUserProvider(), '_auth_user');
+    $gate = new AuthorizationGate($guard, new Container());
+    $abilityCalls = 0;
+    $argumentCalls = 0;
+    $gate->define(
+        'account.view',
+        static function (Authenticatable $actor) use (&$abilityCalls): bool {
+            $abilityCalls++;
+            return true;
+        },
+    );
+    $authorization = new Authorize(
+        $gate,
+        'account.view',
+        static function (Request $request, RouteParameters $parameters) use (&$argumentCalls): array {
+            $argumentCalls++;
+            return [];
+        },
+    );
+    $authentication = new RequireAuthentication(
+        $guard,
+        static fn (Request $request): ResponseInterface =>
+            Response::json(['error' => ['code' => 'unauthenticated']], 401),
+    );
+    $protected = new Router();
+    $protected->get('/account', static fn (): string => 'account')
+        ->middleware($authentication, $authorization);
+
+    $unauthenticated = $protected->dispatch(new Request('GET', '/account'));
+    $assertSame(401, $unauthenticated->status());
+    $assertSame(0, $argumentCalls);
+    $assertSame(0, $abilityCalls);
+
+    $authorizationOnly = new Router();
+    $authorizationOnly->get('/account', static fn (): string => 'account')
+        ->middleware($authorization);
+    $forbidden = $authorizationOnly->dispatch(new Request(
+        'GET',
+        '/account',
+        headers: ['Accept' => 'application/json'],
+    ));
+    $assertSame(403, $forbidden->status());
+    $assertSame(1, $argumentCalls);
+    $assertSame(0, $abilityCalls);
+});
+
+$test('route authorization reports configuration and Gate failures clearly', static function () use ($assertSame, $authorizationGateFactory): void {
+    $gate = $authorizationGateFactory(new FakeAuthenticatable('actor'));
+    $gate->define('configured', static fn (Authenticatable $actor): bool => true);
+
+    $missingParameter = new Router();
+    $missingParameter->get('/records', static fn (): string => 'records')->middleware(new Authorize(
+        $gate,
+        'configured',
+        static fn (Request $request, RouteParameters $parameters): array => [
+            $parameters->require('record'),
+        ],
+    ));
+
+    try {
+        $missingParameter->dispatch(new Request('GET', '/records'));
+        throw new RuntimeException('Expected missing route parameter failure.');
+    } catch (MissingRouteParameterException $exception) {
+        $assertSame(
+            "Route parameter 'record' is not available for this request.",
+            $exception->getMessage(),
+        );
+    }
+
+    $missingAbility = new Router();
+    $missingAbility->get('/missing', static fn (): string => 'missing')->middleware(new Authorize(
+        $gate,
+        'not-defined',
+        static fn (Request $request, RouteParameters $parameters): array => [],
+    ));
+
+    try {
+        $missingAbility->dispatch(new Request('GET', '/missing'));
+        throw new RuntimeException('Expected missing ability failure.');
+    } catch (AbilityNotDefinedException $exception) {
+        $assertSame(
+            "Authorization ability 'not-defined' is not defined.",
+            $exception->getMessage(),
+        );
+    }
+
+    foreach ([
+        static fn (Request $request, RouteParameters $parameters): string => 'record',
+        static fn (Request $request, RouteParameters $parameters): array => ['record' => 'one'],
+    ] as $resolver) {
+        $invalidArguments = new Router();
+        $invalidArguments->get('/invalid', static fn (): string => 'invalid')
+            ->middleware(new Authorize($gate, 'configured', $resolver));
+
+        try {
+            $invalidArguments->dispatch(new Request('GET', '/invalid'));
+            throw new RuntimeException('Expected invalid authorization arguments.');
+        } catch (AuthorizationMiddlewareException $exception) {
+            $assertSame(
+                'The authorization argument resolver must return a list.',
+                $exception->getMessage(),
+            );
+        }
+    }
+
+    $gate->define('throws', static function (Authenticatable $actor): bool {
+        throw new DomainException('authorization service unavailable');
+    });
+    $throws = new Router();
+    $throws->get('/throws', static fn (): string => 'throws')->middleware(new Authorize(
+        $gate,
+        'throws',
+        static fn (Request $request, RouteParameters $parameters): array => [],
+    ));
+
+    try {
+        $throws->dispatch(new Request('GET', '/throws'));
+        throw new RuntimeException('Expected Gate exception propagation.');
+    } catch (DomainException $exception) {
+        $assertSame('authorization service unavailable', $exception->getMessage());
+    }
+
+    try {
+        new Authorize(
+            $gate,
+            ' invalid ',
+            static fn (Request $request, RouteParameters $parameters): array => [],
+        );
+        throw new RuntimeException('Expected invalid middleware ability rejection.');
+    } catch (AuthorizationMiddlewareException $exception) {
+        $assertSame(
+            'Authorization middleware requires a valid exact ability name.',
+            $exception->getMessage(),
+        );
+    }
+});
+
+$test('route authorization evaluates spoofed effective methods explicitly', static function () use ($assertSame, $authorizationGateFactory): void {
+    $gate = $authorizationGateFactory(new FakeAuthenticatable('actor'));
+    $gate->define(
+        'records.patch',
+        static fn (
+            Authenticatable $actor,
+            string $record,
+            string $method,
+            string $originalMethod,
+        ): bool => $record === '42' && $method === 'PATCH' && $originalMethod === 'POST',
+    );
+    $router = new Router();
+    $router->patch('/records/{record}', static fn (Request $request, string $record): string =>
+        $request->originalMethod() . ':' . $request->method() . ':' . $record)
+        ->middleware(new Authorize(
+            $gate,
+            'records.patch',
+            static fn (Request $request, RouteParameters $parameters): array => [
+                $parameters->require('record'),
+                $request->method(),
+                $request->originalMethod(),
+            ],
+        ));
+
+    $response = $router->dispatch(new Request(
+        'POST',
+        '/records/42',
+        body: ['_method' => 'patch'],
+    ));
+
+    $assertSame(200, $response->status());
+    $assertSame('POST:PATCH:42', $response->content());
+});
+
+$decodeIntegrationJson = static function (ResponseInterface $response): array {
+    $decoded = json_decode($response->content(), true, 512, JSON_THROW_ON_ERROR);
+
+    if (!is_array($decoded)) {
+        throw new RuntimeException('Expected an integration JSON object.');
+    }
+
+    return $decoded;
+};
+
+$test('authentication application fixture completes the secure login authorization and logout lifecycle', static function () use ($assertSame, $decodeIntegrationJson): void {
+    $plainText = 'correct horse battery staple';
+    $passwords = new NativePasswordHasher();
+    $users = new InMemoryUserProvider();
+    $users->add(new TestUser(
+        'user-1',
+        'owner@example.test',
+        $passwords->hash($plainText),
+        ['user-1'],
+    ));
+    $users->add(new TestUser(
+        'user-2',
+        'other@example.test',
+        $passwords->hash('another application password'),
+        ['user-2'],
+    ));
+    $application = new AuthenticationApplicationFixture($users, $passwords);
+
+    $guestAccount = $application->request('GET', '/account');
+    $assertSame(401, $guestAccount->response->status());
+    $assertSame(
+        'unauthenticated',
+        $decodeIntegrationJson($guestAccount->response)['error']['code'],
+    );
+
+    $loginPage = $application->request(
+        'GET',
+        '/login',
+        $guestAccount->sessionIdentifier,
+    );
+    $assertSame(200, $loginPage->response->status());
+    $assertSame($guestAccount->sessionIdentifier, $loginPage->sessionIdentifier);
+    $preLoginToken = $decodeIntegrationJson($loginPage->response)['csrf_token'];
+
+    $invalidLogin = $application->request(
+        'POST',
+        '/login',
+        $loginPage->sessionIdentifier,
+        [
+            Csrf::FIELD => $preLoginToken,
+            'email' => 'owner@example.test',
+            'password' => 'wrong password',
+        ],
+    );
+    $assertSame(401, $invalidLogin->response->status());
+    $assertSame($loginPage->sessionIdentifier, $invalidLogin->sessionIdentifier);
+    $assertSame(
+        'invalid_credentials',
+        $decodeIntegrationJson($invalidLogin->response)['error']['code'],
+    );
+    $assertSame(false, str_contains($invalidLogin->response->content(), 'wrong password'));
+
+    $validLogin = $application->request(
+        'POST',
+        '/login',
+        $invalidLogin->sessionIdentifier,
+        [
+            Csrf::FIELD => $preLoginToken,
+            'email' => 'owner@example.test',
+            'password' => $plainText,
+        ],
+    );
+    $assertSame(200, $validLogin->response->status());
+    $assertSame(true, $decodeIntegrationJson($validLogin->response)['authenticated']);
+    $assertSame(true, $passwords->verify($plainText, $users->findByEmail('owner@example.test')->passwordHash()));
+    $assertSame(false, hash_equals(
+        $invalidLogin->sessionIdentifier,
+        $validLogin->sessionIdentifier,
+    ));
+    $assertSame(false, $application->sessions->exists($invalidLogin->sessionIdentifier));
+    $assertSame([
+        'owner@example.test',
+        'owner@example.test',
+        'owner@example.test',
+    ], $users->credentialLookups);
+
+    $replayedPreLoginSession = $application->request(
+        'GET',
+        '/account',
+        $invalidLogin->sessionIdentifier,
+    );
+    $assertSame(401, $replayedPreLoginSession->response->status());
+    $assertSame(false, hash_equals(
+        $invalidLogin->sessionIdentifier,
+        $replayedPreLoginSession->sessionIdentifier,
+    ));
+
+    $stalePreLoginToken = $application->request(
+        'PATCH',
+        '/users/user-1',
+        $validLogin->sessionIdentifier,
+        [Csrf::FIELD => $preLoginToken],
+    );
+    $assertSame(419, $stalePreLoginToken->response->status());
+
+    $account = $application->request(
+        'GET',
+        '/account',
+        $validLogin->sessionIdentifier,
+    );
+    $accountPayload = $decodeIntegrationJson($account->response);
+    $assertSame(200, $account->response->status());
+    $assertSame('user-1', $accountPayload['user']);
+    $assertSame(true, in_array('user-1', $users->retrievedIdentifiers, true));
+    $authenticatedToken = $accountPayload['csrf_token'];
+    $assertSame(false, hash_equals($preLoginToken, $authenticatedToken));
+
+    $guestOnly = $application->request(
+        'GET',
+        '/login',
+        $account->sessionIdentifier,
+    );
+    $assertSame(303, $guestOnly->response->status());
+    $assertSame('/account', $guestOnly->response->headers()['Location']);
+
+    $denied = $application->request(
+        'PATCH',
+        '/users/user-2',
+        $account->sessionIdentifier,
+        [Csrf::FIELD => $authenticatedToken],
+    );
+    $assertSame(403, $denied->response->status());
+    $assertSame('forbidden', $decodeIntegrationJson($denied->response)['error']['code']);
+    $assertSame(false, str_contains($denied->response->content(), 'Sensitive'));
+    $assertSame(false, str_contains($denied->response->content(), 'test_user_cannot_edit'));
+
+    $allowed = $application->request(
+        'PATCH',
+        '/users/user-1',
+        $denied->sessionIdentifier,
+        [Csrf::FIELD => $authenticatedToken],
+    );
+    $assertSame(200, $allowed->response->status());
+    $assertSame('user-1', $decodeIntegrationJson($allowed->response)['edited']);
+
+    $logout = $application->request(
+        'POST',
+        '/logout',
+        $allowed->sessionIdentifier,
+        [Csrf::FIELD => $authenticatedToken],
+    );
+    $assertSame(200, $logout->response->status());
+    $assertSame(false, $decodeIntegrationJson($logout->response)['authenticated']);
+    $assertSame(false, hash_equals(
+        $allowed->sessionIdentifier,
+        $logout->sessionIdentifier,
+    ));
+    $assertSame(false, $application->sessions->exists($allowed->sessionIdentifier));
+    $assertSame(false, array_key_exists(
+        '_auth_user',
+        $application->sessions->data($logout->sessionIdentifier),
+    ));
+
+    $afterLogout = $application->request(
+        'GET',
+        '/account',
+        $logout->sessionIdentifier,
+    );
+    $assertSame(401, $afterLogout->response->status());
+
+    $replayedAuthenticatedSession = $application->request(
+        'GET',
+        '/account',
+        $allowed->sessionIdentifier,
+    );
+    $assertSame(401, $replayedAuthenticatedSession->response->status());
+
+    $staleAuthenticatedToken = $application->request(
+        'POST',
+        '/logout',
+        $logout->sessionIdentifier,
+        [Csrf::FIELD => $authenticatedToken],
+    );
+    $assertSame(419, $staleAuthenticatedToken->response->status());
+});
+
+$test('authentication integration handles stale deleted and failing providers safely', static function () use ($assertSame, $decodeIntegrationJson): void {
+    $passwords = new NativePasswordHasher();
+    $users = new InMemoryUserProvider();
+    $user = new TestUser(
+        'durable-user',
+        'durable@example.test',
+        $passwords->hash('durable password'),
+        ['durable-user'],
+    );
+    $users->add($user);
+    $application = new AuthenticationApplicationFixture($users, $passwords);
+
+    $staleIdentifier = $application->sessions->create([
+        '_auth_user' => 'missing-user',
+    ]);
+    $stale = $application->request('GET', '/account', $staleIdentifier);
+    $assertSame(401, $stale->response->status());
+    $assertSame($staleIdentifier, $stale->sessionIdentifier);
+    $assertSame(
+        'missing-user',
+        $application->sessions->data($staleIdentifier)['_auth_user'],
+    );
+
+    $activeIdentifier = $application->sessions->create([
+        '_auth_user' => 'durable-user',
+    ]);
+    $active = $application->request('GET', '/account', $activeIdentifier);
+    $assertSame(200, $active->response->status());
+    $assertSame('durable-user', $decodeIntegrationJson($active->response)['user']);
+
+    $users->delete('durable-user');
+    $deleted = $application->request(
+        'GET',
+        '/account',
+        $active->sessionIdentifier,
+    );
+    $assertSame(401, $deleted->response->status());
+    $assertSame(
+        'durable-user',
+        $application->sessions->data($deleted->sessionIdentifier)['_auth_user'],
+    );
+
+    $users->add($user);
+    $providerSecret = 'provider failure containing a production secret';
+    $users->failRetrievalWith($providerSecret);
+    $failed = $application->request(
+        'GET',
+        '/account',
+        $deleted->sessionIdentifier,
+    );
+    $assertSame(500, $failed->response->status());
+    $assertSame(true, str_contains($failed->response->content(), 'Something went wrong.'));
+    $assertSame(false, str_contains($failed->response->content(), $providerSecret));
+    $assertSame(false, str_contains($failed->response->content(), $user->passwordHash()));
+    $assertSame(1, count($application->logger->exceptions));
+    $assertSame($providerSecret, $application->logger->exceptions[0]->getMessage());
+    $users->failRetrievalWith(null);
+});
+
+$test('authentication application rebuilds request state without leaking sequential users', static function () use ($assertSame, $decodeIntegrationJson): void {
+    $passwords = new NativePasswordHasher();
+    $users = new InMemoryUserProvider();
+    $users->add(new TestUser(
+        'worker-user-a',
+        'a@example.test',
+        $passwords->hash('password a'),
+        ['worker-user-a'],
+    ));
+    $users->add(new TestUser(
+        'worker-user-b',
+        'b@example.test',
+        $passwords->hash('password b'),
+        ['worker-user-b'],
+    ));
+    $application = new AuthenticationApplicationFixture($users, $passwords);
+
+    $login = static function (
+        string $email,
+        string $password,
+    ) use ($application, $assertSame, $decodeIntegrationJson): string {
+        $page = $application->request('GET', '/login');
+        $token = $decodeIntegrationJson($page->response)['csrf_token'];
+        $authenticated = $application->request(
+            'POST',
+            '/login',
+            $page->sessionIdentifier,
+            [
+                Csrf::FIELD => $token,
+                'email' => $email,
+                'password' => $password,
+            ],
+        );
+        $assertSame(200, $authenticated->response->status());
+
+        return $authenticated->sessionIdentifier;
+    };
+
+    $sessionA = $login('a@example.test', 'password a');
+    $sessionB = $login('b@example.test', 'password b');
+    $assertSame(false, hash_equals($sessionA, $sessionB));
+
+    foreach ([
+        [$sessionA, 'worker-user-a'],
+        [$sessionB, 'worker-user-b'],
+        [$sessionA, 'worker-user-a'],
+        [$sessionB, 'worker-user-b'],
+    ] as [$session, $expectedUser]) {
+        $account = $application->request('GET', '/account', $session);
+        $assertSame(200, $account->response->status());
+        $assertSame($expectedUser, $decodeIntegrationJson($account->response)['user']);
+    }
+
+    $users->delete('worker-user-a');
+    $deletedA = $application->request('GET', '/account', $sessionA);
+    $stillB = $application->request('GET', '/account', $sessionB);
+    $assertSame(401, $deletedA->response->status());
+    $assertSame(200, $stillB->response->status());
+    $assertSame('worker-user-b', $decodeIntegrationJson($stillB->response)['user']);
+});
+
+
 $test('CSRF validation does not create session state for missing tokens', static function () use ($assertSame, $sessionFactory): void {
     $session = $sessionFactory();
     $csrf = new Csrf($session);
