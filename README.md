@@ -976,7 +976,18 @@ php meulah migrate:reset
 php meulah migrate:fresh
 ```
 
-The starter's root `meulah` launcher passes its application root directly to the single framework CLI implementation. The framework also exposes `vendor/bin/meulah`; that entry point honors `MEULAH_APPLICATION_ROOT`, searches upward from the current directory, and then checks its Composer installation relationship. Discovery accepts only projects with the starter's explicit `extra.meulah.application` marker and expected bootstrap, configuration, and route structure.
+The framework exposes `vendor/bin/meulah`. Global information is available from any directory without discovering or booting an application:
+
+```bash
+meulah --help
+meulah -h
+meulah --version
+meulah -V
+```
+
+Global help deliberately lists only global options. Application commands, including `list`, `help <command>`, and every migration command, require a marked Meulah application. Run them inside the application or set `MEULAH_APPLICATION_ROOT` explicitly. The framework version comes from Composer's installed-package metadata, so a tagged distribution reports its package tag while a source checkout may report a development version such as `dev-main`.
+
+The starter's root `meulah` launcher may pass its application root explicitly to the single framework CLI implementation. Otherwise `vendor/bin/meulah` honors `MEULAH_APPLICATION_ROOT`, searches upward from the current directory, and then checks its Composer installation relationship. Discovery accepts only projects with the starter's explicit `extra.meulah.application` marker and expected bootstrap, configuration, and route structure. Argument classification happens before discovery; application boot, configuration, routes, and migrations are loaded only after an application command has a valid root.
 
 Console features are individual objects implementing `Meulah\Console\Command`. `ConsoleApplication` owns only registration and dispatch, while the launcher composes the built-in migration commands for an application root. Command names and aliases are unique, help output is sorted by command name, and equally close unknown-command suggestions are sorted by name.
 

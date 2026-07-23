@@ -33,7 +33,7 @@ final class ProjectRoot
         }
 
         throw new RuntimeException(
-            'No Meulah application was found. Run the command inside an application or set MEULAH_APPLICATION_ROOT.',
+            'No Meulah application was found. Run this command inside a Meulah application or set MEULAH_APPLICATION_ROOT.',
         );
     }
 

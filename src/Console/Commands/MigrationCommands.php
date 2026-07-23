@@ -10,6 +10,19 @@ use Meulah\Console\ProjectRoot;
 
 final class MigrationCommands
 {
+    /** @return list<string> */
+    public static function names(): array
+    {
+        return [
+            'make:migration',
+            'migrate',
+            'migrate:status',
+            'migrate:rollback',
+            'migrate:reset',
+            'migrate:fresh',
+        ];
+    }
+
     /** @return list<Command> */
     public static function forApplication(string $root): array
     {

@@ -31,6 +31,7 @@ use Meulah\Console\CommandRegistry;
 use Meulah\Console\ConsoleInputException;
 use Meulah\Console\ConsoleApplication;
 use Meulah\Console\Input as ConsoleInput;
+use Meulah\Console\Launcher;
 use Meulah\Console\Output as ConsoleOutput;
 use Meulah\Console\OutputException;
 use Meulah\Console\ProjectRoot;
@@ -73,6 +74,7 @@ use Meulah\Session\Session;
 use Meulah\Session\SessionException;
 use Meulah\Session\SessionMiddleware;
 use Meulah\Support\Environment;
+use Meulah\Support\FrameworkVersion;
 use Meulah\Validation\ValidationException;
 use Meulah\Validation\ValidationRuleException;
 use Tests\Fixtures\AuthenticationApplicationFixture;
@@ -118,6 +120,55 @@ $assertSame = static function (mixed $expected, mixed $actual): void {
             var_export($actual, true),
         ));
     }
+};
+
+/**
+ * @param list<string> $arguments
+ * @param array<string, string|null> $environment
+ * @return array{status: int, output: string, error: string}
+ */
+$runCli = static function (array $arguments, string $workingDirectory, array $environment = []): array {
+    $processEnvironment = getenv();
+    $processEnvironment = is_array($processEnvironment) ? $processEnvironment : [];
+    unset($processEnvironment['MEULAH_APPLICATION_ROOT']);
+
+    foreach ($environment as $key => $value) {
+        if ($value === null) {
+            unset($processEnvironment[$key]);
+            continue;
+        }
+
+        $processEnvironment[$key] = $value;
+    }
+
+    $process = proc_open(
+        [PHP_BINARY, dirname(__DIR__) . '/bin/meulah', ...$arguments],
+        [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ],
+        $pipes,
+        $workingDirectory,
+        $processEnvironment,
+        ['bypass_shell' => true],
+    );
+
+    if (!is_resource($process)) {
+        throw new RuntimeException('Unable to start the Meulah CLI test process.');
+    }
+
+    fclose($pipes[0]);
+    $output = stream_get_contents($pipes[1]);
+    $error = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+
+    return [
+        'status' => proc_close($process),
+        'output' => $output === false ? '' : $output,
+        'error' => $error === false ? '' : $error,
+    ];
 };
 
 $sessionFactory = static function (): Session {
@@ -4781,6 +4832,186 @@ $test('project root discovery rejects unmarked Composer projects', static functi
             true,
             str_starts_with($exception->getMessage(), 'Directory is not a marked Meulah application:'),
         );
+    }
+});
+
+$test('global help aliases run before application-root discovery', static function () use ($assertSame): void {
+    foreach (['--help', '-h'] as $option) {
+        $discoveries = 0;
+        $output = ConsoleOutput::buffered();
+        $launcher = new Launcher(
+            $output,
+            static function () use (&$discoveries): string {
+                $discoveries++;
+                throw new RuntimeException('Root discovery must not run.');
+            },
+            static fn (): string => 'test-version',
+        );
+
+        $assertSame(0, $launcher->run(['meulah', $option]));
+        $assertSame(0, $discoveries);
+        $assertSame(true, str_contains($output->output(), 'Meulah CLI'));
+        $assertSame(true, str_contains($output->output(), 'Global options:'));
+        $assertSame(true, str_contains($output->output(), 'Application commands require a Meulah application.'));
+        $assertSame(false, str_contains($output->output(), 'migrate'));
+        $assertSame('', $output->errorOutput());
+    }
+});
+
+$test('global version aliases use the resolver before application-root discovery', static function () use ($assertSame): void {
+    foreach (['--version', '-V'] as $option) {
+        $discoveries = 0;
+        $output = ConsoleOutput::buffered();
+        $launcher = new Launcher(
+            $output,
+            static function () use (&$discoveries): string {
+                $discoveries++;
+                throw new RuntimeException('Root discovery must not run.');
+            },
+            static fn (): string => '0.2.0-test',
+        );
+
+        $assertSame(0, $launcher->run(['meulah', $option]));
+        $assertSame(0, $discoveries);
+        $assertSame('Meulah CLI 0.2.0-test' . PHP_EOL, $output->output());
+        $assertSame('', $output->errorOutput());
+    }
+});
+
+$test('unknown commands are classified without application-root discovery', static function () use ($assertSame): void {
+    $discoveries = 0;
+    $output = ConsoleOutput::buffered();
+    $launcher = new Launcher(
+        $output,
+        static function () use (&$discoveries): string {
+            $discoveries++;
+            throw new RuntimeException('Root discovery must not run.');
+        },
+        static fn (): string => 'test-version',
+    );
+
+    $assertSame(1, $launcher->run(['meulah', 'migrte']));
+    $assertSame(0, $discoveries);
+    $assertSame('', $output->output());
+    $assertSame(true, str_contains($output->errorOutput(), "Command 'migrte' is not defined."));
+    $assertSame(true, str_contains($output->errorOutput(), "Did you mean 'migrate'?"));
+});
+
+$test('installed CLI global information works outside an application', static function () use ($assertSame, $runCli): void {
+    $outside = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'meulah_cli_' . bin2hex(random_bytes(6));
+
+    if (!mkdir($outside, 0775, true) && !is_dir($outside)) {
+        throw new RuntimeException('Unable to create the outside-application CLI fixture.');
+    }
+
+    try {
+        foreach (['--help', '-h'] as $option) {
+            $result = $runCli([$option], $outside);
+            $assertSame(0, $result['status']);
+            $assertSame('', $result['error']);
+            $assertSame(true, str_contains($result['output'], 'Global options:'));
+            $assertSame(false, str_contains($result['output'], 'migrate'));
+        }
+
+        require_once dirname(__DIR__) . '/vendor/autoload.php';
+        $expectedVersion = 'Meulah CLI ' . FrameworkVersion::current() . PHP_EOL;
+
+        foreach (['--version', '-V'] as $option) {
+            $result = $runCli([$option], $outside);
+            $assertSame(0, $result['status']);
+            $assertSame($expectedVersion, $result['output']);
+            $assertSame('', $result['error']);
+        }
+    } finally {
+        rmdir($outside);
+    }
+});
+
+$test('installed CLI application commands require a valid application root', static function () use ($assertSame, $runCli): void {
+    $outside = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'meulah_cli_' . bin2hex(random_bytes(6));
+
+    if (!mkdir($outside, 0775, true) && !is_dir($outside)) {
+        throw new RuntimeException('Unable to create the outside-application CLI fixture.');
+    }
+
+    try {
+        foreach (['migrate', 'migrate:status'] as $command) {
+            $result = $runCli([$command], $outside);
+            $assertSame(1, $result['status']);
+            $assertSame('', $result['output']);
+            $assertSame(
+                'Error: No Meulah application was found. Run this command inside a Meulah application or set MEULAH_APPLICATION_ROOT.' . PHP_EOL,
+                $result['error'],
+            );
+        }
+
+        $invalidRoot = $outside . DIRECTORY_SEPARATOR . 'missing';
+        $result = $runCli(['migrate'], $outside, ['MEULAH_APPLICATION_ROOT' => $invalidRoot]);
+        $assertSame(1, $result['status']);
+        $assertSame('', $result['output']);
+        $assertSame('Error: Application directory does not exist: ' . $invalidRoot . PHP_EOL, $result['error']);
+    } finally {
+        rmdir($outside);
+    }
+});
+
+$test('installed CLI application commands work inside and through an explicit root', static function () use ($assertSame, $runCli): void {
+    $applicationRoot = realpath(__DIR__ . '/fixtures/application');
+    $outside = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'meulah_cli_' . bin2hex(random_bytes(6));
+
+    if ($applicationRoot === false) {
+        throw new RuntimeException('Application fixture is missing.');
+    }
+
+    if (!mkdir($outside, 0775, true) && !is_dir($outside)) {
+        throw new RuntimeException('Unable to create the outside-application CLI fixture.');
+    }
+
+    try {
+        $inside = $runCli(['migrate', '--help'], $applicationRoot);
+        $assertSame(0, $inside['status']);
+        $assertSame('', $inside['error']);
+        $assertSame(true, str_contains($inside['output'], 'Run all pending migrations.'));
+
+        $explicit = $runCli(
+            ['migrate:status', '--help'],
+            $outside,
+            ['MEULAH_APPLICATION_ROOT' => $applicationRoot],
+        );
+        $assertSame(0, $explicit['status']);
+        $assertSame('', $explicit['error']);
+        $assertSame(true, str_contains($explicit['output'], 'Show migration status.'));
+    } finally {
+        rmdir($outside);
+    }
+});
+
+$test('installed CLI rejects unknown global options and unknown commands outside applications', static function () use ($assertSame, $runCli): void {
+    $outside = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'meulah_cli_' . bin2hex(random_bytes(6));
+
+    if (!mkdir($outside, 0775, true) && !is_dir($outside)) {
+        throw new RuntimeException('Unable to create the outside-application CLI fixture.');
+    }
+
+    try {
+        $option = $runCli(['--unknown'], $outside);
+        $assertSame(1, $option['status']);
+        $assertSame('', $option['output']);
+        $assertSame(
+            "Error: Unknown global option '--unknown'. Run 'meulah --help' for usage." . PHP_EOL,
+            $option['error'],
+        );
+
+        $command = $runCli(['unknown-command'], $outside);
+        $assertSame(1, $command['status']);
+        $assertSame('', $command['output']);
+        $assertSame(
+            "Command 'unknown-command' is not defined." . PHP_EOL
+                . "Run 'meulah --help' for global usage." . PHP_EOL,
+            $command['error'],
+        );
+    } finally {
+        rmdir($outside);
     }
 });
 

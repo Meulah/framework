@@ -3,8 +3,7 @@
 
 declare(strict_types=1);
 
-use Meulah\Console\Application;
-use Meulah\Console\ProjectRoot;
+use Meulah\Console\Launcher;
 
 $packageRoot = dirname(__DIR__);
 $autoloaders = [
@@ -19,16 +18,9 @@ foreach ($autoloaders as $autoload) {
     }
 }
 
-if (!class_exists(Application::class)) {
+if (!class_exists(Launcher::class)) {
     fwrite(STDERR, 'Composer dependencies are missing. Run composer install.' . PHP_EOL);
     exit(1);
 }
 
-try {
-    $root = ProjectRoot::discover();
-} catch (RuntimeException $exception) {
-    fwrite(STDERR, 'Error: ' . $exception->getMessage() . PHP_EOL);
-    exit(1);
-}
-
-exit(Application::runFrom($root, $argv));
+exit((new Launcher())->run($argv));
