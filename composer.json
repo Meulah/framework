@@ -3,8 +3,21 @@
     "description": "A small, explicit PHP framework for conventional server-rendered applications.",
     "type": "library",
     "license": "MIT",
+    "keywords": [
+        "php",
+        "framework",
+        "mvc",
+        "routing",
+        "server-rendered"
+    ],
+    "homepage": "https://github.com/Meulah/framework",
+    "support": {
+        "issues": "https://github.com/Meulah/framework/issues",
+        "source": "https://github.com/Meulah/framework",
+        "security": "https://github.com/Meulah/framework/security/policy"
+    },
     "require": {
-        "php": ">=8.1",
+        "php": "^8.1",
         "ext-fileinfo": "*",
         "ext-pdo": "*"
     },
@@ -22,7 +35,11 @@
         "ext-pdo_sqlite": "Required when using the SQLite database driver."
     },
     "scripts": {
-        "test": "php tests/run.php"
+        "test": "php tests/run.php",
+        "check": [
+            "@lint",
+            "@test"
+        ]
     },
     "config": {
         "sort-packages": true
