@@ -981,11 +981,23 @@ The framework exposes `vendor/bin/meulah`. Global information is available from 
 ```bash
 meulah --help
 meulah -h
+meulah --help --ansi
+meulah --help --no-ansi
 meulah --version
 meulah -V
 ```
 
 Global help deliberately lists only global options. Application commands, including `list`, `help <command>`, and every migration command, require a marked Meulah application. Run them inside the application or set `MEULAH_APPLICATION_ROOT` explicitly. The framework version comes from Composer's installed-package metadata, so a tagged distribution reports its package tag while a source checkout may report a development version such as `dev-main`.
+
+CLI colors use a small semantic palette and are detected independently for standard output and error output. The precedence is explicit:
+
+1. `--no-ansi` disables colors, including when `--ansi` is also present.
+2. `--ansi` forces colors for global help or version output and overrides `NO_COLOR`.
+3. A present `NO_COLOR` environment variable disables automatic colors.
+4. A present `CI` environment variable disables automatic colors, even if the runner allocated a pseudo-terminal.
+5. Otherwise Meulah emits ANSI only when the destination stream is an interactive terminal with detected support.
+
+Redirected streams, pipes, logs, and CI captures therefore remain plain text by default. Explicit `--ansi` overrides both `NO_COLOR` and `CI`. On Windows, automatic styling additionally requires PHP to report VT100 support; `--ansi` remains available for terminals known to support it. Every styled fragment is reset immediately to prevent style bleeding.
 
 The starter's root `meulah` launcher may pass its application root explicitly to the single framework CLI implementation. Otherwise `vendor/bin/meulah` honors `MEULAH_APPLICATION_ROOT`, searches upward from the current directory, and then checks its Composer installation relationship. Discovery accepts only projects with the starter's explicit `extra.meulah.application` marker and expected bootstrap, configuration, and route structure. Argument classification happens before discovery; application boot, configuration, routes, and migrations are loaded only after an application command has a valid root.
 

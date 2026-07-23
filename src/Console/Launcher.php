@@ -48,7 +48,9 @@ final class Launcher
 
             return $this->application()->run($arguments);
         } catch (Throwable $exception) {
-            $this->output->errorln('Error: ' . $exception->getMessage());
+            $this->output->errorln(
+                'Error: ' . $this->output->errorStyle()->error($exception->getMessage()),
+            );
 
             return 1;
         }
@@ -56,7 +58,9 @@ final class Launcher
 
     private function renderUnknownCommand(string $requested): int
     {
-        $this->output->errorln("Command '{$requested}' is not defined.");
+        $this->output->errorln($this->output->errorStyle()->error(
+            "Command '{$requested}' is not defined.",
+        ));
         $suggestions = $this->suggestions($requested);
 
         if (count($suggestions) === 1) {

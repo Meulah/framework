@@ -29,12 +29,14 @@ use Meulah\Console\Application as ConsoleEntrypoint;
 use Meulah\Console\Command;
 use Meulah\Console\CommandRegistry;
 use Meulah\Console\ConsoleInputException;
+use Meulah\Console\ConsoleStyle;
 use Meulah\Console\ConsoleApplication;
 use Meulah\Console\Input as ConsoleInput;
 use Meulah\Console\Launcher;
 use Meulah\Console\Output as ConsoleOutput;
 use Meulah\Console\OutputException;
 use Meulah\Console\ProjectRoot;
+use Meulah\Console\TerminalCapabilities;
 use Meulah\Database\Connection;
 use Meulah\Database\Migration;
 use Meulah\Database\MigrationFinder;
@@ -122,6 +124,12 @@ $assertSame = static function (mixed $expected, mixed $actual): void {
     }
 };
 
+$stripAnsi = static function (string $text): string {
+    $plain = preg_replace('/\x1B\[[0-?]*[ -\/]*[@-~]/', '', $text);
+
+    return is_string($plain) ? $plain : $text;
+};
+
 /**
  * @param list<string> $arguments
  * @param array<string, string|null> $environment
@@ -131,6 +139,7 @@ $runCli = static function (array $arguments, string $workingDirectory, array $en
     $processEnvironment = getenv();
     $processEnvironment = is_array($processEnvironment) ? $processEnvironment : [];
     unset($processEnvironment['MEULAH_APPLICATION_ROOT']);
+    unset($processEnvironment['NO_COLOR']);
 
     foreach ($environment as $key => $value) {
         if ($value === null) {
@@ -4835,6 +4844,177 @@ $test('project root discovery rejects unmarked Composer projects', static functi
     }
 });
 
+$test('console styles use a fixed semantic palette and always reset', static function () use ($assertSame): void {
+    $style = new ConsoleStyle(true);
+
+    $assertSame("\033[1;36mMeulah CLI\033[0m", $style->title('Meulah CLI'));
+    $assertSame("\033[1;36mUsage:\033[0m", $style->heading('Usage:'));
+    $assertSame("\033[32mmeulah\033[0m", $style->command('meulah'));
+    $assertSame("\033[33m--help\033[0m", $style->option('--help'));
+    $assertSame("\033[90msecondary\033[0m", $style->muted('secondary'));
+    $assertSame("\033[32mdone\033[0m", $style->success('done'));
+    $assertSame("\033[33mcareful\033[0m", $style->warning('careful'));
+    $assertSame("\033[31mfailed\033[0m", $style->error('failed'));
+    $assertSame("\033[33mdev-main\033[0m", $style->version('dev-main'));
+    $assertSame('', $style->error(''));
+    $assertSame('plain', (new ConsoleStyle(false))->error('plain'));
+});
+
+$test('console output detects stdout and stderr ANSI support independently', static function () use ($assertSame): void {
+    $stdout = fopen('php://memory', 'w+');
+    $stderr = fopen('php://memory', 'w+');
+
+    if ($stdout === false || $stderr === false) {
+        throw new RuntimeException('Unable to create ANSI stream fixtures.');
+    }
+
+    try {
+        $terminal = new TerminalCapabilities(
+            static fn (mixed $stream): bool => $stream === $stdout,
+        );
+        $output = new ConsoleOutput(
+            false,
+            $stdout,
+            $stderr,
+            $terminal,
+            static fn (string $key): mixed => null,
+        );
+
+        $assertSame(true, $output->style()->enabled());
+        $assertSame(false, $output->errorStyle()->enabled());
+    } finally {
+        fclose($stdout);
+        fclose($stderr);
+    }
+});
+
+$test('global help supports forced and disabled ANSI with stable visible alignment', static function () use ($assertSame, $stripAnsi): void {
+    $forced = ConsoleOutput::buffered();
+    $launcher = new Launcher(
+        $forced,
+        static fn (): string => throw new RuntimeException('Root discovery must not run.'),
+        static fn (): string => 'dev-test',
+    );
+
+    $assertSame(0, $launcher->run(['meulah', '--help', '--ansi']));
+    $assertSame(true, str_contains($forced->output(), "\033[1;36mMeulah CLI\033[0m"));
+    $assertSame(true, str_contains($forced->output(), "\033[32mmeulah\033[0m"));
+    $assertSame(true, str_contains($forced->output(), "\033[33m--ansi\033[0m"));
+    $assertSame(true, substr_count($forced->output(), "\033[0m") >= 10);
+
+    $visible = $stripAnsi($forced->output());
+    $assertSame(true, str_contains($visible, '  -h, --help     Show global help.' . PHP_EOL));
+    $assertSame(true, str_contains($visible, '  -V, --version  Show the framework version.' . PHP_EOL));
+    $assertSame(true, str_contains($visible, '      --ansi     Force ANSI colors.' . PHP_EOL));
+    $assertSame(true, str_contains($visible, '      --no-ansi  Disable ANSI colors.' . PHP_EOL));
+
+    $disabled = ConsoleOutput::buffered();
+    $launcher = new Launcher(
+        $disabled,
+        static fn (): string => throw new RuntimeException('Root discovery must not run.'),
+        static fn (): string => 'dev-test',
+    );
+    $assertSame(0, $launcher->run(['meulah', '--ansi', '--help', '--no-ansi']));
+    $assertSame(false, str_contains($disabled->output(), "\033["));
+    $assertSame($visible, $disabled->output());
+});
+
+$test('global version styles its title and resolved value separately', static function () use ($assertSame, $stripAnsi): void {
+    $forced = ConsoleOutput::buffered();
+    $launcher = new Launcher(
+        $forced,
+        static fn (): string => throw new RuntimeException('Root discovery must not run.'),
+        static fn (): string => 'dev-test',
+    );
+
+    $assertSame(0, $launcher->run(['meulah', '--ansi', '--version']));
+    $assertSame(
+        "\033[1;36mMeulah CLI\033[0m  \033[33mdev-test\033[0m" . PHP_EOL,
+        $forced->output(),
+    );
+    $assertSame('Meulah CLI  dev-test' . PHP_EOL, $stripAnsi($forced->output()));
+
+    $plain = ConsoleOutput::buffered();
+    $launcher = new Launcher(
+        $plain,
+        static fn (): string => throw new RuntimeException('Root discovery must not run.'),
+        static fn (): string => 'dev-test',
+    );
+    $assertSame(0, $launcher->run(['meulah', '--version', '--no-ansi']));
+    $assertSame('Meulah CLI  dev-test' . PHP_EOL, $plain->output());
+});
+
+$test('NO_COLOR disables automatic styling while explicit CLI options take precedence', static function () use ($assertSame): void {
+    $terminal = new TerminalCapabilities(static fn (mixed $stream): bool => true);
+    $environment = static fn (string $key): mixed => $key === 'NO_COLOR' ? '' : null;
+
+    $noColor = new ConsoleOutput(true, null, null, $terminal, $environment);
+    $launcher = new Launcher(
+        $noColor,
+        static fn (): string => throw new RuntimeException('Root discovery must not run.'),
+        static fn (): string => 'dev-test',
+    );
+    $assertSame(0, $launcher->run(['meulah', '--help']));
+    $assertSame(false, str_contains($noColor->output(), "\033["));
+
+    $forced = new ConsoleOutput(true, null, null, $terminal, $environment);
+    $launcher = new Launcher(
+        $forced,
+        static fn (): string => throw new RuntimeException('Root discovery must not run.'),
+        static fn (): string => 'dev-test',
+    );
+    $assertSame(0, $launcher->run(['meulah', '--help', '--ansi']));
+    $assertSame(true, str_contains($forced->output(), "\033["));
+
+    $disabled = new ConsoleOutput(true, null, null, $terminal, static fn (string $key): mixed => null);
+    $launcher = new Launcher(
+        $disabled,
+        static fn (): string => throw new RuntimeException('Root discovery must not run.'),
+        static fn (): string => 'dev-test',
+    );
+    $assertSame(0, $launcher->run(['meulah', '--help', '--no-ansi']));
+    $assertSame(false, str_contains($disabled->output(), "\033["));
+    $ci = new ConsoleOutput(
+        true,
+        null,
+        null,
+        $terminal,
+        static fn (string $key): mixed => $key === 'CI' ? 'true' : null,
+    );
+    $launcher = new Launcher(
+        $ci,
+        static fn (): string => throw new RuntimeException('Root discovery must not run.'),
+        static fn (): string => 'dev-test',
+    );
+    $assertSame(0, $launcher->run(['meulah', '--help']));
+    $assertSame(false, str_contains($ci->output(), "\033["));
+});
+
+
+$test('redirected output defaults to plain text and detected error messages are red', static function () use ($assertSame): void {
+    $redirected = ConsoleOutput::buffered();
+    $launcher = new Launcher(
+        $redirected,
+        static fn (): string => throw new RuntimeException('Root discovery must not run.'),
+        static fn (): string => 'dev-test',
+    );
+    $assertSame(0, $launcher->run(['meulah', '--help']));
+    $assertSame(false, str_contains($redirected->output(), "\033["));
+
+    $terminal = new TerminalCapabilities(static fn (mixed $stream): bool => true);
+    $errorOutput = new ConsoleOutput(true, null, null, $terminal, static fn (string $key): mixed => null);
+    $launcher = new Launcher(
+        $errorOutput,
+        static fn (): string => throw new RuntimeException('No Meulah application was found.'),
+        static fn (): string => 'dev-test',
+    );
+    $assertSame(1, $launcher->run(['meulah', 'migrate']));
+    $assertSame(
+        "Error: \033[31mNo Meulah application was found.\033[0m" . PHP_EOL,
+        $errorOutput->errorOutput(),
+    );
+});
+
 $test('global help aliases run before application-root discovery', static function () use ($assertSame): void {
     foreach (['--help', '-h'] as $option) {
         $discoveries = 0;
@@ -4873,7 +5053,7 @@ $test('global version aliases use the resolver before application-root discovery
 
         $assertSame(0, $launcher->run(['meulah', $option]));
         $assertSame(0, $discoveries);
-        $assertSame('Meulah CLI 0.2.0-test' . PHP_EOL, $output->output());
+        $assertSame('Meulah CLI  0.2.0-test' . PHP_EOL, $output->output());
         $assertSame('', $output->errorOutput());
     }
 });
@@ -4914,7 +5094,7 @@ $test('installed CLI global information works outside an application', static fu
         }
 
         require_once dirname(__DIR__) . '/vendor/autoload.php';
-        $expectedVersion = 'Meulah CLI ' . FrameworkVersion::current() . PHP_EOL;
+        $expectedVersion = 'Meulah CLI  ' . FrameworkVersion::current() . PHP_EOL;
 
         foreach (['--version', '-V'] as $option) {
             $result = $runCli([$option], $outside);

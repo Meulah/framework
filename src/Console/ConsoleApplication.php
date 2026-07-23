@@ -70,7 +70,9 @@ final class ConsoleApplication
 
             return $command->execute($input, $this->output);
         } catch (Throwable $exception) {
-            $this->output->errorln('Error: ' . $exception->getMessage());
+            $this->output->errorln(
+                'Error: ' . $this->output->errorStyle()->error($exception->getMessage()),
+            );
             return 1;
         }
     }
@@ -133,7 +135,9 @@ final class ConsoleApplication
 
     private function renderUnknownCommand(string $name): int
     {
-        $this->output->errorln("Command '{$name}' is not defined.");
+        $this->output->errorln($this->output->errorStyle()->error(
+            "Command '{$name}' is not defined.",
+        ));
         $suggestions = $this->commands->suggestions($name);
 
         if (count($suggestions) === 1) {

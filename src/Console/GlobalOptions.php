@@ -24,58 +24,115 @@ final class GlobalOptions
      */
     public function handle(array $arguments, Output $output): ?int
     {
-        $requested = $arguments[1] ?? null;
+        $tokens = array_slice($arguments, 1);
 
-        if (in_array($requested, ['--help', '-h'], true)) {
-            $this->assertArgumentCount($arguments, $requested);
+        if ($tokens === []) {
+            return null;
+        }
+
+        $requested = $tokens[0];
+        $informationOptions = ['--help', '-h', '--version', '-V'];
+        $styleOptions = ['--ansi', '--no-ansi'];
+
+        if (!in_array($requested, [...$informationOptions, ...$styleOptions], true)) {
+            if (str_starts_with($requested, '-')) {
+                throw new ConsoleInputException(
+                    "Unknown global option '{$requested}'. Run 'meulah --help' for usage.",
+                );
+            }
+
+            return null;
+        }
+
+        $output->configureAnsi(
+            in_array('--no-ansi', $tokens, true)
+                ? false
+                : (in_array('--ansi', $tokens, true) ? true : null),
+        );
+
+        $information = null;
+
+        foreach ($tokens as $token) {
+            if (in_array($token, $styleOptions, true)) {
+                continue;
+            }
+
+            if (in_array($token, $informationOptions, true)) {
+                if ($information !== null) {
+                    throw new ConsoleInputException('Only one global information option may be used.');
+                }
+
+                $information = $token;
+                continue;
+            }
+
+            if (str_starts_with($token, '-')) {
+                throw new ConsoleInputException(
+                    "Unknown global option '{$token}'. Run 'meulah --help' for usage.",
+                );
+            }
+
+            throw new ConsoleInputException("Global options do not accept argument '{$token}'.");
+        }
+
+        if ($information === null) {
+            throw new ConsoleInputException(
+                "Global color options must be used with '--help' or '--version'.",
+            );
+        }
+
+        if (in_array($information, ['--help', '-h'], true)) {
             $this->renderHelp($output);
 
             return 0;
         }
 
-        if (in_array($requested, ['--version', '-V'], true)) {
-            $this->assertArgumentCount($arguments, $requested);
-            $version = ($this->versionResolver)();
+        $version = ($this->versionResolver)();
 
-            if (!is_string($version) || trim($version) === '') {
-                throw new ConsoleInputException('The framework version could not be resolved.');
-            }
-
-            $output->writeln('Meulah CLI ' . $version);
-
-            return 0;
+        if (!is_string($version) || trim($version) === '') {
+            throw new ConsoleInputException('The framework version could not be resolved.');
         }
 
-        if (is_string($requested) && str_starts_with($requested, '-')) {
-            throw new ConsoleInputException(
-                "Unknown global option '{$requested}'. Run 'meulah --help' for usage.",
-            );
-        }
+        $style = $output->style();
+        $output->writeln($style->title('Meulah CLI') . '  ' . $style->version($version));
 
-        return null;
+        return 0;
     }
 
     private function renderHelp(Output $output): void
     {
-        $output->writeln('Meulah CLI');
+        $style = $output->style();
+
+        $output->writeln($style->title('Meulah CLI'));
         $output->writeln();
-        $output->writeln('Usage:');
-        $output->writeln('  meulah [global option]');
-        $output->writeln('  meulah <command> [arguments] [options]');
+        $output->writeln($style->heading('Usage:'));
+        $output->writeln('  ' . $style->command('meulah') . ' ' . $style->muted('[global option]'));
+        $output->writeln('  ' . $style->command('meulah') . ' ' . $style->muted('<command> [arguments] [options]'));
         $output->writeln();
-        $output->writeln('Global options:');
-        $output->writeln('  -h, --help     Show global help.');
-        $output->writeln('  -V, --version  Show the framework version.');
+        $output->writeln($style->heading('Global options:'));
+        $this->renderOption($output, $style, 2, '-h, --help', 'Show global help.');
+        $this->renderOption($output, $style, 2, '-V, --version', 'Show the framework version.');
+        $this->renderOption($output, $style, 6, '--ansi', 'Force ANSI colors.');
+        $this->renderOption($output, $style, 6, '--no-ansi', 'Disable ANSI colors.');
         $output->writeln();
-        $output->writeln('Application commands require a Meulah application. Run them inside an application');
-        $output->writeln('or set MEULAH_APPLICATION_ROOT.');
+        $output->writeln($style->muted('Application commands require a Meulah application.'));
+        $output->writeln($style->muted('Run them inside an application or set MEULAH_APPLICATION_ROOT.'));
     }
 
-    /** @param list<string> $arguments */
-    private function assertArgumentCount(array $arguments, string $option): void
-    {
-        if (count($arguments) > 2) {
-            throw new ConsoleInputException("Global option '{$option}' does not accept arguments.");
-        }
+    private function renderOption(
+        Output $output,
+        ConsoleStyle $style,
+        int $indent,
+        string $option,
+        string $description,
+    ): void {
+        $spacing = max(2, 17 - $indent - strlen($option));
+
+        $output->writeln(
+            str_repeat(' ', $indent)
+                . $style->option($option)
+                . str_repeat(' ', $spacing)
+                . $style->muted($description),
+        );
     }
 }
