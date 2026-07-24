@@ -180,6 +180,59 @@ $runCli = static function (array $arguments, string $workingDirectory, array $en
     ];
 };
 
+$createApplicationFixture = static function (string $root, array $omit = [], bool $legacy = false): void {
+    if (!mkdir($root, 0775, true) && !is_dir($root)) {
+        throw new RuntimeException('Unable to create an application-root fixture.');
+    }
+
+    $composer = '{"extra":{"meulah":{"application":true}}}';
+    if (!in_array('composer.json', $omit, true)) {
+        file_put_contents($root . '/composer.json', $composer);
+    }
+
+    if ($legacy) {
+        mkdir($root . '/config', 0775, true);
+        mkdir($root . '/routes', 0775, true);
+        file_put_contents($root . '/bootstrap.php', '<?php return null;');
+        return;
+    }
+
+    if (!in_array('start/app.php', $omit, true)) {
+        mkdir($root . '/start', 0775, true);
+        file_put_contents($root . '/start/app.php', '<?php return null;');
+    }
+
+    if (!in_array('settings/', $omit, true)) {
+        mkdir($root . '/settings', 0775, true);
+    }
+
+    if (!in_array('routes/', $omit, true)) {
+        mkdir($root . '/routes', 0775, true);
+    }
+};
+
+$removeDirectory = static function (string $root): void {
+    if (!is_dir($root)) {
+        return;
+    }
+
+    $items = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST,
+    );
+
+    foreach ($items as $item) {
+        if ($item->isDir()) {
+            rmdir($item->getPathname());
+            continue;
+        }
+
+        unlink($item->getPathname());
+    }
+
+    rmdir($root);
+};
+
 $sessionFactory = static function (): Session {
     return new class implements Session {
         /** @var array<string, mixed> */
@@ -4793,10 +4846,10 @@ $test('configuration supports nested values and strict types', static function (
 });
 
 $test('configuration loads application configuration files', static function () use ($assertSame): void {
-    $config = Repository::load(__DIR__ . '/fixtures/config');
+    $config = Repository::load(__DIR__ . '/fixtures/application/settings');
 
     $assertSame(true, $config->has('app.environment'));
-    $assertSame('mysql', $config->string('database.driver'));
+    $assertSame('sqlite', $config->string('database.driver'));
 });
 
 $test('project root discovery walks up from an application subdirectory', static function () use ($assertSame): void {
@@ -4839,8 +4892,82 @@ $test('project root discovery rejects unmarked Composer projects', static functi
     } catch (RuntimeException $exception) {
         $assertSame(
             true,
-            str_starts_with($exception->getMessage(), 'Directory is not a marked Meulah application:'),
+            str_starts_with($exception->getMessage(), 'The supplied application root is not a valid Meulah application.'),
         );
+    }
+});
+
+$test('explicit project roots are canonicalized and accept native paths containing spaces', static function () use ($assertSame, $createApplicationFixture, $removeDirectory): void {
+    $root = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'meulah application ' . bin2hex(random_bytes(4));
+    $createApplicationFixture($root);
+
+    try {
+        $canonical = realpath($root);
+        if ($canonical === false) {
+            throw new RuntimeException('Unable to resolve the spaced application fixture.');
+        }
+
+        $assertSame($canonical, ProjectRoot::explicit($root));
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $assertSame($canonical, ProjectRoot::explicit(str_replace('\\', '/', $root)));
+        }
+    } finally {
+        $removeDirectory($root);
+    }
+});
+
+$test('explicit project roots report every missing official marker without exposing the root', static function () use ($assertSame, $createApplicationFixture, $removeDirectory): void {
+    $markers = ['composer.json', 'start/app.php', 'settings/', 'routes/'];
+    foreach ($markers as $marker) {
+        $root = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'meulah_missing_' . bin2hex(random_bytes(4));
+        $createApplicationFixture($root, [$marker]);
+
+        try {
+            try {
+                ProjectRoot::explicit($root);
+                throw new RuntimeException('Expected missing application marker rejection.');
+            } catch (RuntimeException $exception) {
+                $assertSame(true, str_contains($exception->getMessage(), "- {$marker}"));
+                $assertSame(false, str_contains($exception->getMessage(), $root));
+            }
+        } finally {
+            $removeDirectory($root);
+        }
+    }
+});
+
+$test('upward discovery reports exact missing markers from a marked application', static function () use ($assertSame, $createApplicationFixture, $removeDirectory): void {
+    $root = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'meulah_discovery_' . bin2hex(random_bytes(4));
+    $createApplicationFixture($root, ['settings/']);
+
+    try {
+        try {
+            ProjectRoot::discover($root);
+            throw new RuntimeException('Expected incomplete marked application rejection.');
+        } catch (RuntimeException $exception) {
+            $assertSame(true, str_starts_with($exception->getMessage(), 'No Meulah application was found.'));
+            $assertSame(true, str_contains($exception->getMessage(), '- settings/'));
+            $assertSame(false, str_contains($exception->getMessage(), '- routes/'));
+        }
+    } finally {
+        $removeDirectory($root);
+    }
+});
+
+$test('legacy bootstrap and config applications are rejected', static function () use ($assertSame, $createApplicationFixture, $removeDirectory): void {
+    $root = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'meulah_legacy_' . bin2hex(random_bytes(4));
+    $createApplicationFixture($root, legacy: true);
+
+    try {
+        try {
+            ProjectRoot::explicit($root);
+            throw new RuntimeException('Expected the legacy layout to be rejected.');
+        } catch (RuntimeException $exception) {
+            $assertSame(true, str_contains($exception->getMessage(), '- start/app.php'));
+            $assertSame(true, str_contains($exception->getMessage(), '- settings/'));
+        }
+    } finally {
+        $removeDirectory($root);
     }
 });
 
@@ -5058,6 +5185,28 @@ $test('global version aliases use the resolver before application-root discovery
     }
 });
 
+$test('modern launcher accepts an explicit root without weakening global information', static function () use ($assertSame): void {
+    $root = realpath(__DIR__ . '/fixtures/application');
+    if ($root === false) {
+        throw new RuntimeException('Application fixture is missing.');
+    }
+
+    $output = ConsoleOutput::buffered();
+    $status = Launcher::runFrom($root, ['meulah', 'migrate', '--help'], $output, static fn (): string => 'test');
+    $assertSame(0, $status);
+    $assertSame(true, str_contains($output->output(), 'Run all pending migrations.'));
+
+    $missing = $root . DIRECTORY_SEPARATOR . 'missing';
+    $globalOutput = ConsoleOutput::buffered();
+    $assertSame(0, Launcher::runFrom($missing, ['meulah', '--help'], $globalOutput, static fn (): string => 'test'));
+    $assertSame(true, str_contains($globalOutput->output(), 'Global options:'));
+
+    $invalidOutput = ConsoleOutput::buffered();
+    $assertSame(1, Launcher::runFrom($missing, ['meulah', 'migrate'], $invalidOutput, static fn (): string => 'test'));
+    $assertSame(true, str_contains($invalidOutput->errorOutput(), 'does not exist or is not a directory'));
+    $assertSame(false, str_contains($invalidOutput->errorOutput(), $missing));
+});
+
 $test('unknown commands are classified without application-root discovery', static function () use ($assertSame): void {
     $discoveries = 0;
     $output = ConsoleOutput::buffered();
@@ -5119,17 +5268,17 @@ $test('installed CLI application commands require a valid application root', sta
             $result = $runCli([$command], $outside);
             $assertSame(1, $result['status']);
             $assertSame('', $result['output']);
-            $assertSame(
-                'Error: No Meulah application was found. Run this command inside a Meulah application or set MEULAH_APPLICATION_ROOT.' . PHP_EOL,
-                $result['error'],
-            );
+            $assertSame(true, str_contains($result['error'], 'Error: No Meulah application was found.'));
+            $assertSame(true, str_contains($result['error'], '- start/app.php'));
+            $assertSame(true, str_contains($result['error'], '- settings/'));
+            $assertSame(false, str_contains($result['error'], $outside));
         }
 
         $invalidRoot = $outside . DIRECTORY_SEPARATOR . 'missing';
         $result = $runCli(['migrate'], $outside, ['MEULAH_APPLICATION_ROOT' => $invalidRoot]);
         $assertSame(1, $result['status']);
         $assertSame('', $result['output']);
-        $assertSame('Error: Application directory does not exist: ' . $invalidRoot . PHP_EOL, $result['error']);
+        $assertSame('Error: The supplied application root does not exist or is not a directory.' . PHP_EOL, $result['error']);
     } finally {
         rmdir($outside);
     }
@@ -5652,6 +5801,21 @@ $test('migration status runs through its command object', static function () use
 
     $assertSame(0, $console->run(['meulah', 'migrate:status']));
     $assertSame('No migrations found.' . PHP_EOL, $output->output());
+});
+
+$test('migration context boots start app once and reads settings', static function () use ($assertSame): void {
+    $before = (int) ($GLOBALS['meulah_test_application_boots'] ?? 0);
+    $root = realpath(__DIR__ . '/fixtures/application');
+    if ($root === false) {
+        throw new RuntimeException('Application fixture is missing.');
+    }
+
+    $context = new \Meulah\Console\MigrationContext($root);
+    $input = ConsoleInput::fromTokens('migrate', []);
+    $expected = $root . DIRECTORY_SEPARATOR . 'database/migrations';
+    $assertSame($expected, $context->migrationPath($input));
+    $assertSame($expected, $context->migrationPath($input));
+    $assertSame($before + 1, $GLOBALS['meulah_test_application_boots']);
 });
 
 $test('every migration console command preserves the migration lifecycle', static function () use ($assertSame): void {

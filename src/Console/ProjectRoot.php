@@ -9,6 +9,14 @@ use RuntimeException;
 
 final class ProjectRoot
 {
+    /** @var array<string, 'file'|'directory'> */
+    private const REQUIRED_MARKERS = [
+        'composer.json' => 'file',
+        'start/app.php' => 'file',
+        'settings/' => 'directory',
+        'routes/' => 'directory',
+    ];
+
     public static function discover(?string $start = null): string
     {
         $configured = Environment::get('MEULAH_APPLICATION_ROOT');
@@ -26,23 +34,17 @@ final class ProjectRoot
             return $discovered;
         }
 
-        $installedApplication = dirname(__DIR__, 5);
-
-        if (self::isApplication($installedApplication)) {
-            return realpath($installedApplication) ?: $installedApplication;
-        }
-
-        throw new RuntimeException(
-            'No Meulah application was found. Run this command inside a Meulah application or set MEULAH_APPLICATION_ROOT.',
-        );
+        throw new RuntimeException(self::notFoundMessage());
     }
 
     public static function explicit(string $root): string
     {
         $directory = self::realDirectory($root);
+        $missing = self::missingMarkers($directory);
+        $marked = self::isMarkedApplication($directory);
 
-        if (!self::isApplication($directory)) {
-            throw new RuntimeException("Directory is not a marked Meulah application: {$directory}");
+        if ($missing !== [] || !$marked) {
+            throw new RuntimeException(self::invalidRootMessage($missing, $marked));
         }
 
         return $directory;
@@ -53,7 +55,7 @@ final class ProjectRoot
         $directory = realpath($path);
 
         if ($directory === false || !is_dir($directory)) {
-            throw new RuntimeException("Application directory does not exist: {$path}");
+            throw new RuntimeException('The supplied application root does not exist or is not a directory.');
         }
 
         return $directory;
@@ -62,8 +64,19 @@ final class ProjectRoot
     private static function walkUp(string $directory): ?string
     {
         while (true) {
-            if (self::isApplication($directory)) {
+            $missing = self::missingMarkers($directory);
+            $marked = self::isMarkedApplication($directory);
+
+            if ($missing === [] && $marked) {
                 return $directory;
+            }
+
+            if ($marked) {
+                throw new RuntimeException(self::invalidRootMessage(
+                    $missing,
+                    true,
+                    'No Meulah application was found.',
+                ));
             }
 
             $parent = dirname($directory);
@@ -76,21 +89,78 @@ final class ProjectRoot
         }
     }
 
-    private static function isApplication(string $directory): bool
+    /** @return list<string> */
+    private static function missingMarkers(string $directory): array
     {
-        if (
-            !is_file($directory . '/composer.json')
-            || !is_file($directory . '/bootstrap.php')
-            || !is_dir($directory . '/config')
-            || !is_dir($directory . '/routes')
-        ) {
-            return false;
+        $missing = [];
+
+        foreach (self::REQUIRED_MARKERS as $marker => $type) {
+            $path = $directory . DIRECTORY_SEPARATOR
+                . str_replace('/', DIRECTORY_SEPARATOR, rtrim($marker, '/'));
+            $exists = $type === 'file' ? is_file($path) : is_dir($path);
+
+            if (!$exists) {
+                $missing[] = $marker;
+            }
         }
 
-        $contents = file_get_contents($directory . '/composer.json');
+        return $missing;
+    }
+
+    private static function isMarkedApplication(string $directory): bool
+    {
+        $composerFile = $directory . DIRECTORY_SEPARATOR . 'composer.json';
+        $contents = is_file($composerFile) ? file_get_contents($composerFile) : false;
         $composer = $contents === false ? null : json_decode($contents, true);
 
         return is_array($composer)
             && ($composer['extra']['meulah']['application'] ?? false) === true;
+    }
+
+    /** @param list<string> $missing */
+    private static function invalidRootMessage(
+        array $missing,
+        bool $marked,
+        string $heading = 'The supplied application root is not a valid Meulah application.',
+    ): string
+    {
+        $lines = [$heading, ''];
+
+        if ($missing !== []) {
+            $lines[] = 'Missing required markers:';
+
+            foreach ($missing as $marker) {
+                $lines[] = "- {$marker}";
+            }
+        }
+
+        if (!$marked) {
+            if ($missing !== []) {
+                $lines[] = '';
+            }
+
+            $lines[] = 'composer.json must declare extra.meulah.application as true.';
+        }
+
+        return implode(PHP_EOL, $lines);
+    }
+
+    private static function notFoundMessage(): string
+    {
+        $lines = [
+            'No Meulah application was found.',
+            '',
+            'Expected a Meulah application containing:',
+        ];
+
+        foreach (array_keys(self::REQUIRED_MARKERS) as $marker) {
+            $lines[] = "- {$marker}";
+        }
+
+        $lines[] = '';
+        $lines[] = 'composer.json must declare extra.meulah.application as true.';
+        $lines[] = 'Run this command inside a Meulah application or set MEULAH_APPLICATION_ROOT.';
+
+        return implode(PHP_EOL, $lines);
     }
 }

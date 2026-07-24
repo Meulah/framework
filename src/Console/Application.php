@@ -6,10 +6,7 @@ namespace Meulah\Console;
 
 use Meulah\Console\Commands\MigrationCommands;
 
-/**
- * Backward-compatible entry point for application launchers.
- * New console composition should use ConsoleApplication directly.
- */
+/** Application-command composition for one validated Meulah application root. */
 final class Application
 {
     private readonly ConsoleApplication $console;
@@ -21,12 +18,6 @@ final class Application
         foreach (MigrationCommands::forApplication($root) as $command) {
             $this->console->add($command);
         }
-    }
-
-    /** @param list<string> $arguments */
-    public static function runFrom(string $applicationRoot, array $arguments): int
-    {
-        return (new self($applicationRoot))->run($arguments);
     }
 
     public function add(Command $command): void

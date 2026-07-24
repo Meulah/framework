@@ -9,7 +9,7 @@ Meulah is a small, explicit PHP framework for conventional server-rendered appli
 - Secure defaults belong in the framework.
 - Plain PHP views and direct PDO access remain first-class choices.
 - Application features stay separate from the reusable kernel.
-- Existing Meulah applications should have a practical upgrade path.
+- Breaking conventions are explicit, documented, and reserved for versioned releases.
 
 Meulah currently requires PHP 8.1 or newer.
 
@@ -23,7 +23,35 @@ bin/       executable installed as vendor/bin/meulah
 tests/     framework contract tests
 ```
 
-The [Meulah application starter](https://github.com/Meulah/meulah) is maintained in its own repository. It owns application concerns: the `App\` namespace, environment file, configuration, bootstrap, routes, controllers, views, migrations, public entry point, and root `meulah` launcher. The framework root is a Composer library and is not itself a web application.
+The [Meulah application starter](https://github.com/Meulah/meulah) is maintained in its own repository. It owns the `App\` namespace, environment file, settings, startup files, routes, controllers, views, migrations, runtime directories, persistent uploads, public entry point, and root `meulah` launcher. The framework root is a Composer library and is not itself a web application.
+
+## Official application layout
+
+Meulah v0.2.0 defines one application filesystem convention:
+
+```text
+app/
+start/
+  app.php
+  middleware.php
+  routes.php
+settings/
+routes/
+views/
+database/migrations/
+data/uploads/
+public/
+runtime/
+tests/
+composer.json
+meulah
+```
+
+Application discovery requires `composer.json`, `start/app.php`, `settings/`, and `routes/`. The Composer file must declare `extra.meulah.application` as `true`.
+
+This is a breaking application-layout change for v0.2.0. The former root boot file and configuration directory are intentionally not recognized, and no forwarding files or dual-layout discovery are provided.
+
+`runtime/` contains disposable or regenerable output such as logs, sessions, caches, and future compiled views. `data/uploads/` contains persistent application-owned uploads and must not be removed by runtime cleanup.
 
 ## Request lifecycle
 
@@ -31,8 +59,10 @@ Inside an application created from the starter, the request lifecycle remains vi
 
 ```text
 public/index.php
-  -> bootstrap.php
-  -> Application
+  -> start/app.php
+  -> app/bindings.php
+  -> start/middleware.php
+  -> start/routes.php
   -> routes/web.php
   -> Router
   -> route handler
@@ -844,7 +874,7 @@ final class AddRequestHeader implements Middleware
 }
 ```
 
-Register middleware for every request in `bootstrap.php`:
+Register middleware for every request in `start/middleware.php`, which the starter loads during application boot:
 
 ```php
 $app->middleware(new AddRequestHeader());
@@ -909,7 +939,7 @@ Treat listener registration as application-lifetime configuration. In a long-run
 
 ## Configuration
 
-Configuration files live in `config/` and return plain PHP arrays. They are loaded into a small repository with dot-notation and strict typed access:
+Application settings live in `settings/` and return plain PHP arrays. They are loaded into a small configuration repository with dot-notation and strict typed access:
 
 ```php
 $environment = $app->config()->string('app.environment');
@@ -999,7 +1029,19 @@ CLI colors use a small semantic palette and are detected independently for stand
 
 Redirected streams, pipes, logs, and CI captures therefore remain plain text by default. Explicit `--ansi` overrides both `NO_COLOR` and `CI`. On Windows, automatic styling additionally requires PHP to report VT100 support; `--ansi` remains available for terminals known to support it. Every styled fragment is reset immediately to prevent style bleeding.
 
-The starter's root `meulah` launcher may pass its application root explicitly to the single framework CLI implementation. Otherwise `vendor/bin/meulah` honors `MEULAH_APPLICATION_ROOT`, searches upward from the current directory, and then checks its Composer installation relationship. Discovery accepts only projects with the starter's explicit `extra.meulah.application` marker and expected bootstrap, configuration, and route structure. Argument classification happens before discovery; application boot, configuration, routes, and migrations are loaded only after an application command has a valid root.
+The starter's root `meulah` launcher uses the modern explicit-root entry point:
+
+```php
+use Meulah\Console\Launcher;
+
+require __DIR__ . '/vendor/autoload.php';
+
+exit(Launcher::runFrom(__DIR__, $argv));
+```
+
+`Launcher::runFrom()` canonicalizes and validates the supplied root for application commands without searching parent directories. Global help and version output remain available without validating or booting that root.
+
+`vendor/bin/meulah` honors `MEULAH_APPLICATION_ROOT` and otherwise searches the current directory and its parents. Discovery requires the explicit Composer marker plus `start/app.php`, `settings/`, and `routes/`. Argument classification happens before discovery; application boot, settings, routes, and migrations are loaded only after an application command has a valid root.
 
 Console features are individual objects implementing `Meulah\Console\Command`. `ConsoleApplication` owns only registration and dispatch, while the launcher composes the built-in migration commands for an application root. Command names and aliases are unique, help output is sorted by command name, and equally close unknown-command suggestions are sorted by name.
 
@@ -1015,6 +1057,8 @@ exit($console->run($argv));
 ```
 
 Unknown commands, invalid input, and thrown command exceptions write to stderr and return status `1`; command return codes otherwise pass through unchanged. Command execution is non-interactive and never prompts in CI.
+
+Migration commands validate the application root, require `start/app.php` once per command lifecycle, read database settings from the returned `Application`, and resolve the configured migration path relative to the application root unless an absolute path is supplied.
 
 `migrate` runs only files not recorded in the migration history table. All migrations from one invocation share a batch number, and `migrate:rollback` reverses the most recent batch in reverse filename order. `migrate:reset` rolls back every recorded batch. `migrate:fresh` drops every table—including tables not managed by migrations—and then reruns all migrations. A recorded migration whose file has been removed appears as `Missing` in the status output.
 
@@ -1036,18 +1080,18 @@ Production responses hide exception details. Development responses include the e
 
 ## Installation
 
-Application developers should use the separate [Meulah application starter](https://github.com/Meulah/meulah). Once the `0.1` packages are published, the normal installation path is:
+Application developers should use the separate [Meulah application starter](https://github.com/Meulah/meulah). The intended v0.2.0 installation path is:
 
 ```bash
-composer create-project meulah/starter my-app
+composer create-project meulah/meulah my-app
 ```
 
-The repository split is complete. Publishing compatible `0.1` releases for `meulah/framework` and `meulah/starter` remains the release gate before advertising `create-project` as generally available.
+The starter repository exists, but `meulah/meulah` is not yet published as a stable Composer package. Do not advertise the command above as available until its first stable release is registered on Packagist.
 
 Custom skeleton authors and advanced integrations may install the framework directly:
 
 ```bash
-composer require meulah/framework:^0.1
+composer require meulah/framework:^0.2
 ```
 
 Framework contributors run `composer install` and `composer test` at this repository root. Application bootstrapping, `create-project`, and clean-consumer installation are owned and tested by the starter repository.

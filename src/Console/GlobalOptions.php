@@ -117,6 +117,7 @@ final class GlobalOptions
         $output->writeln();
         $output->writeln($style->muted('Application commands require a Meulah application.'));
         $output->writeln($style->muted('Run them inside an application or set MEULAH_APPLICATION_ROOT.'));
+        $output->writeln($style->muted('Expected markers: composer.json, start/app.php, settings/, routes/.'));
     }
 
     private function renderOption(

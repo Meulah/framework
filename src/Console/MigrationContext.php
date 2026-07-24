@@ -81,10 +81,10 @@ final class MigrationContext
             return $this->kernel;
         }
 
-        $kernel = require $this->root . '/bootstrap.php';
+        $kernel = require $this->root . '/start/app.php';
 
         if (!$kernel instanceof Kernel) {
-            throw new RuntimeException('Application bootstrap must return a Meulah application.');
+            throw new RuntimeException('Application boot file start/app.php must return a Meulah application.');
         }
 
         return $this->kernel = $kernel;

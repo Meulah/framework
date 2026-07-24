@@ -30,6 +30,27 @@ final class Launcher
         );
     }
 
+    /**
+     * Run the CLI for an explicitly known application root.
+     *
+     * The root is validated only when an application command is requested,
+     * so global help and version output remain application-independent.
+     *
+     * @param list<string> $arguments
+     */
+    public static function runFrom(
+        string $applicationRoot,
+        array $arguments,
+        ?Output $output = null,
+        ?callable $versionResolver = null,
+    ): int {
+        return (new self(
+            $output,
+            static fn (): string => ProjectRoot::explicit($applicationRoot),
+            $versionResolver,
+        ))->run($arguments);
+    }
+
     /** @param list<string> $arguments */
     public function run(array $arguments): int
     {
