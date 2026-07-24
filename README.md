@@ -55,18 +55,27 @@ This is a breaking application-layout change for v0.2.0. The former root boot fi
 
 ## Request lifecycle
 
-Inside an application created from the starter, the request lifecycle remains visible:
+Inside an application created from the starter, the default request lifecycle
+remains visible:
 
 ```text
-public/index.php
+Browser
+  -> public/index.php
   -> start/app.php
   -> app/bindings.php
   -> start/middleware.php
   -> start/routes.php
   -> routes/web.php
   -> Router
-  -> route handler
+  -> controller
+  -> PHP view
+  -> response
 ```
+
+`start/app.php` is the application composition root. It loads settings, creates
+the container and framework services, applies application bindings and
+middleware, and then loads routes. The router may also dispatch directly to a
+callable route handler when an application does not need a controller or view.
 
 Routes are declared explicitly in `routes/web.php`:
 
