@@ -479,19 +479,25 @@ Index access uses brackets:
 Resolution is strict:
 
 - on arrays, dot access checks an exact string key;
-- on objects, dot access may read only an initialized, declared, public property;
-- private, protected, static, dynamic, and uninitialized properties are rejected;
-- magic property access through __get or __isset is not invoked;
-- getters are not inferred;
-- object methods are never invoked;
+- object property access is not supported in version one;
+- an object is never probed or observed to determine whether a property exists, is initialized, is public, is hooked, or is lazy;
+- implementations must reject object dot access before any operation that can invoke a property hook, magic method, lazy-object initializer, proxy factory, method, or equivalent application code;
+- registered functions may receive or return object values as opaque trusted-application values, but template expressions cannot traverse their properties;
 - array index access accepts an integer or string key;
 - ArrayAccess objects are not invoked in version one;
 - string character indexing is not supported;
-- a missing key or property is an undefined-value error;
+- a missing array key is an undefined-value error;
 - accessing a property or index on null is an error;
 - numeric array keys require bracket syntax.
 
-A later data-access contract may replace or extend public-property access, but it must not silently introduce method execution.
+This restriction is intentional. On PHP 8.4 and newer, property hooks can execute arbitrary application code when a property is read, and lazy objects can run an initializer or proxy factory when property state is observed, including through reflection.
+
+References:
+
+- [PHP property hooks](https://www.php.net/manual/en/language.oop5.property-hooks.php)
+- [PHP lazy objects and initialization triggers](https://www.php.net/manual/en/language.oop5.lazy-objects.php)
+
+A later data-access contract may add object-like traversal only if values are pre-materialized into passive engine-owned data, or an equivalent contract can prove that both rejection and reads cannot invoke hooks, magic access, lazy initialization, proxy factories, methods, or equivalent future PHP features. Such support requires an explicit language-version decision and must not silently change version-one behavior.
 
 ## 13. Operators and precedence
 
@@ -560,12 +566,13 @@ Undefined includes:
 
 - a root variable absent from render data;
 - a missing array key;
-- a missing or inaccessible object property;
 - an absent loop variable outside its scope;
 - an included variable that was not passed;
 - an unknown function.
 
 Undefined values do not become null, false, an empty string, or an empty list. Defaults do not replace undefined values.
+
+Attempted object property traversal is an unsupported-access error rather than undefined-value resolution. The renderer must report that error before observing the object's property state.
 
 Applications must provide optional data explicitly as null or use a registered function whose arguments can be evaluated without referencing a missing value.
 
@@ -890,6 +897,7 @@ Opia aims to prevent:
 - arbitrary PHP execution;
 - environment and service-container discovery;
 - static and object method execution from expressions;
+- implicit application-code execution through object property reads;
 - template path traversal;
 - include and layout cycles;
 - second-pass template injection through raw HTML;
@@ -1171,22 +1179,21 @@ The following questions remain open and require explicit approval before impleme
 2. Literal delimiter ergonomics: rely on HTML character references for visible [[ text, or add a verbatim element or escape sequence?
 3. Attribute detection: make [[ inside ordinary attribute values a hard error as proposed, or preserve it literally with a development warning?
 4. HTML strictness: reject omitted optional end tags and all mismatched ordinary HTML, or validate only Opia structural nesting and leave ordinary HTML recovery to browsers?
-5. Object data model: allow declared public properties as proposed, require arrays only, or define a dedicated template-data access contract?
-6. Function baseline: ship no built-ins, or standardize a minimal pure set such as count and format helpers?
-7. Equality: permit numeric comparison between integers and decimals as proposed, or require identical scalar types?
-8. Arithmetic: retain arithmetic operators, or keep version-one expressions limited to boolean and comparison operations?
-9. Iterable policy: permit every Traversable, or require arrays plus an explicit safe-iterable contract?
-10. Resource budgets: choose default limits for loop iterations, include depth, AST depth, output bytes, and function calls.
-11. Loop shadowing: reject every visible-name collision as proposed, or permit explicit lexical shadowing?
-12. Layout depth: keep one layout hop in version one, or specify nested layout slot forwarding now?
-13. Direct layout rendering: allow yields to use defaults without a page frame, or reject direct rendering of layout templates?
-14. Yield defaults: keep the default attribute as escaped plain text, or support fallback child fragments?
-15. Trusted HTML API: approve the capability's PHP contract, name, constructors, and sanitizer integration.
-16. Whitespace: enable standalone structural-line trimming by default, make it configurable, or preserve every source byte?
-17. Null and boolean output: retain strict output errors, or define canonical text rendering?
-18. Template roots: support one root only, or specify package namespaces and override order before 1.0?
-19. Component collision policy: decide whether future component names are case-sensitive and how they map to PHP classes or registries.
-20. Dynamic attribute policy: define URL schemes, boolean presence, class-token validation, and event-handler prohibition before enabling any reserved namespace.
+5. Function baseline: ship no built-ins, or standardize a minimal pure set such as count and format helpers?
+6. Equality: permit numeric comparison between integers and decimals as proposed, or require identical scalar types?
+7. Arithmetic: retain arithmetic operators, or keep version-one expressions limited to boolean and comparison operations?
+8. Iterable policy: permit every Traversable, or require arrays plus an explicit safe-iterable contract?
+9. Resource budgets: choose default limits for loop iterations, include depth, AST depth, output bytes, and function calls.
+10. Loop shadowing: reject every visible-name collision as proposed, or permit explicit lexical shadowing?
+11. Layout depth: keep one layout hop in version one, or specify nested layout slot forwarding now?
+12. Direct layout rendering: allow yields to use defaults without a page frame, or reject direct rendering of layout templates?
+13. Yield defaults: keep the default attribute as escaped plain text, or support fallback child fragments?
+14. Trusted HTML API: approve the capability's PHP contract, name, constructors, and sanitizer integration.
+15. Whitespace: enable standalone structural-line trimming by default, make it configurable, or preserve every source byte?
+16. Null and boolean output: retain strict output errors, or define canonical text rendering?
+17. Template roots: support one root only, or specify package namespaces and override order before 1.0?
+18. Component collision policy: decide whether future component names are case-sensitive and how they map to PHP classes or registries.
+19. Dynamic attribute policy: define URL schemes, boolean presence, class-token validation, and event-handler prohibition before enabling any reserved namespace.
 
 These are design risks, not missing implementation details. The language should not be declared stable until they are resolved.
 
@@ -1233,6 +1240,8 @@ No phase is implemented by this RFC.
 ### Phase 4: safe interpreter
 
 - strict value model;
+- array-only record traversal with object property access rejected before object state is observed;
+- PHP 8.4+ conformance fixtures proving hooked properties, lazy ghosts, and lazy proxies are rejected without invoking hooks, initializers, or proxy factories;
 - HTML text escaping;
 - undefined and null errors;
 - condition evaluation;
@@ -1281,4 +1290,3 @@ Separate RFCs must precede:
 - additional expression functions or operators.
 
 Components and dynamic attributes must not be implemented merely because their namespaces are reserved.
-
