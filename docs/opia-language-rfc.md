@@ -476,22 +476,84 @@ Index access uses brackets:
 [[ labels[currentLocale] ]]
 ~~~
 
+**Traversal performed by Opia is data lookup only and must never execute object behaviour.**
+
+For version one, native PHP arrays are the only values that support dot or index traversal.
+
 Resolution is strict:
 
-- on arrays, dot access checks an exact string key;
-- on objects, dot access may read only an initialized, declared, public property;
-- private, protected, static, dynamic, and uninitialized properties are rejected;
-- magic property access through __get or __isset is not invoked;
-- getters are not inferred;
-- object methods are never invoked;
-- array index access accepts an integer or string key;
-- ArrayAccess objects are not invoked in version one;
+- dot access requires the current value to be a native PHP array and resolves an exact string key;
+- bracket access requires the current value to be a native PHP array and the index expression to evaluate to an integer or string key;
+- no key-name normalization is performed: `firstName` does not resolve `first_name`, and case is not changed;
+- numeric array keys require bracket syntax;
+- a missing array key is an undefined-value error;
+- if any traversed value is an object, further dot or index traversal produces an unsupported-access error before object state is inspected;
+- the object rule applies equally to readonly DTOs, `stdClass`, `ArrayAccess`, `Traversable`, framework collections and models, proxies, lazy objects, and any other PHP object;
+- an object is never probed or observed to determine whether a property exists, is initialized, is public, is hooked, is lazy, or supports array-like access;
+- implementations must reject object traversal before any operation that can invoke a property hook, magic method, `ArrayAccess` method, lazy-object initializer, proxy factory, method, or equivalent application code;
+- registered functions may receive or return object values as opaque trusted-application values, but template expressions cannot traverse their properties or indexes;
 - string character indexing is not supported;
-- a missing key or property is an undefined-value error;
-- accessing a property or index on null is an error;
-- numeric array keys require bracket syntax.
+- accessing a property or index on null is an error.
 
-A later data-access contract may replace or extend public-property access, but it must not silently introduce method execution.
+A nested native-array structure is valid:
+
+~~~php
+[
+    'user' => [
+        'profile' => [
+            'name' => 'Sanmi',
+        ],
+    ],
+]
+~~~
+
+~~~opia
+[[ user.profile.name ]]
+~~~
+
+An object at the same boundary is not traversable, even when it is deliberately simple:
+
+~~~php
+final readonly class UserViewData
+{
+    public function __construct(
+        public string $name,
+        public string $email,
+    ) {}
+}
+
+[
+    'user' => new UserViewData('Sanmi', 'sanmi@example.com'),
+]
+~~~
+
+~~~opia
+[[ user.name ]]
+~~~
+
+The expression above produces an unsupported-access error. The renderer may report the object's type and the offending path, but it must not inspect or print the object's property values.
+
+The same rule applies to intermediate values. If `user` is a native array but `user.profile` is an object, resolving `user.profile.name` may read the `profile` array key, then must stop before reading anything from the object.
+
+This restriction is intentional. On PHP 8.4 and newer, property hooks can execute arbitrary application code when a property is read, and lazy objects can run an initializer or proxy factory when property state is observed, including through reflection.
+
+References:
+
+- [PHP property hooks](https://www.php.net/manual/en/language.oop5.property-hooks.php)
+- [PHP lazy objects and initialization triggers](https://www.php.net/manual/en/language.oop5.lazy-objects.php)
+
+The intended application boundary is:
+
+~~~text
+domain objects
+    -> application-controlled projection
+    -> native PHP array template data
+    -> Opia
+~~~
+
+Security is the primary reason for the restriction, but the boundary also keeps template data explicit and predictable. The RFC does not prescribe whether projection belongs in a controller, presenter, view-model mapper, or another application layer.
+
+A later data-access contract may add object-like traversal only if values are pre-materialized into passive engine-owned data, or an equivalent contract can prove that both rejection and reads cannot invoke hooks, magic access, lazy initialization, proxy factories, methods, or equivalent future PHP features. Such support requires an explicit language-version decision and must not silently change version-one behavior. Opia must not automatically call a method such as `toOpiaData()` while resolving a template path, because that call would itself execute application code.
 
 ## 13. Operators and precedence
 
@@ -550,6 +612,16 @@ Rules:
 - an unregistered call is an error;
 - a function result follows the same output, iteration, property, and raw-capability rules as any other value.
 
+Objects are permitted across the registered-function boundary because that boundary is explicit application-controlled execution:
+
+~~~opia
+[[ format_user_name(user) ]]
+~~~
+
+If `user` is an object, Opia passes the object reference to the registered function without traversing or inspecting it. The registered function may inspect or invoke application behavior because registered functions are already trusted application code.
+
+An object returned by a registered function remains opaque to Opia. It cannot be output directly or traversed with dot or index access. It may be passed onward to another registered function subject to the normal expression grammar.
+
 The version-one built-in function list remains subject to approval. No PHP function is implicitly built in.
 
 ## 15. Undefined variable behavior
@@ -560,12 +632,13 @@ Undefined includes:
 
 - a root variable absent from render data;
 - a missing array key;
-- a missing or inaccessible object property;
 - an absent loop variable outside its scope;
 - an included variable that was not passed;
 - an unknown function.
 
 Undefined values do not become null, false, an empty string, or an empty list. Defaults do not replace undefined values.
+
+Attempted object property or index traversal is an unsupported-access error rather than undefined-value resolution. The renderer must report that error before observing the object's property or index state.
 
 Applications must provide optional data explicitly as null or use a registered function whose arguments can be evaluated without referencing a missing value.
 
@@ -617,6 +690,8 @@ Iteration rules:
 - none does not receive loop variables;
 - there is no implicit loop metadata object or counter;
 - nested loops are valid when their binding names do not collide.
+
+The `Traversable` allowance in this section applies only to `<each>` iteration. It does not make a `Traversable` object dot-traversable or indexable. If an approved iterable yields an object, the loop variable may be passed to a registered function, but Opia cannot traverse that object's properties or indexes.
 
 A maximum iteration budget is recommended for defense against resource exhaustion, but its exact configuration is unresolved.
 
@@ -727,6 +802,19 @@ Undefined value "user.profile.name".
        ^
 Included from dashboard.opia:8:5.
 ~~~
+
+Object traversal uses a render/data diagnostic rather than an undefined-value diagnostic. Until the separate error catalogue assigns an exact code, the proposed development shape is:
+
+~~~text
+users/index.opia:14:9 [OPIA-Rxxx]
+Unsupported object traversal at "user.profile".
+Expected native array data, received App\ProfileViewData.
+    [[ user.profile.name ]]
+            ^
+Included from dashboard.opia:8:5.
+~~~
+
+A diagnostic may include the PHP type name because identifying the type does not require reading object properties. It must not include property values or other object state.
 
 Diagnostics must not include runtime values, raw HTML, passwords, session identifiers, environment values, or function arguments.
 
@@ -890,6 +978,7 @@ Opia aims to prevent:
 - arbitrary PHP execution;
 - environment and service-container discovery;
 - static and object method execution from expressions;
+- implicit application-code execution through object property reads;
 - template path traversal;
 - include and layout cycles;
 - second-pass template injection through raw HTML;
@@ -1012,6 +1101,32 @@ Documentation showing whole Opia examples should HTML-encode the opener when tha
 ~~~
 
 Ordinary custom elements pass through when balanced and not reserved. Opia parses its own nested structures before a browser sees the rendered document.
+
+### 27.8 Native-array traversal and explicit object function boundary
+
+Nested native arrays are traversable:
+
+~~~php
+[
+    'user' => [
+        'profile' => [
+            'name' => 'Sanmi',
+        ],
+    ],
+]
+~~~
+
+~~~opia
+<p>[[ user.profile.name ]]</p>
+~~~
+
+An object may also be passed opaquely to an explicitly registered function:
+
+~~~opia
+<p>[[ format_user_name(user) ]]</p>
+~~~
+
+In the second example, `user` may be an object because the registered function is the explicit trusted execution boundary. Opia itself does not read `user` properties.
 
 ## 28. Examples that must be rejected
 
@@ -1163,6 +1278,65 @@ Reason: ordinary HTML cannot open in one structural branch and close outside it.
 
 Reason: case variants of reserved tags are rejected, and the lowercase bare name is owned by Opia rather than an ordinary custom element.
 
+### 28.17 Direct readonly-object traversal
+
+~~~php
+final readonly class UserViewData
+{
+    public function __construct(
+        public string $name,
+        public string $email,
+    ) {}
+}
+~~~
+
+~~~opia
+[[ user.name ]]
+~~~
+
+Reason: all PHP objects are opaque to Opia traversal in version one, including simple readonly DTOs. Application code must project the object to native array template data or pass it to an explicitly registered function.
+
+### 28.18 Object encountered inside a nested array
+
+~~~php
+[
+    'user' => [
+        'profile' => new ProfileViewData(...),
+    ],
+]
+~~~
+
+~~~opia
+[[ user.profile.name ]]
+~~~
+
+Reason: `user.profile` may resolve the array key, but the next traversal step would inspect an object. Resolution stops with an unsupported-access error before object state is observed.
+
+### 28.19 Convenience key conversion
+
+~~~php
+[
+    'user' => [
+        'first_name' => 'Sanmi',
+    ],
+]
+~~~
+
+~~~opia
+[[ user.firstName ]]
+~~~
+
+Reason: dot access uses exact string keys. Opia does not translate camelCase to snake_case, change case, or perform any other convenience key conversion.
+
+### 28.20 Object-like containers
+
+~~~opia
+[[ collection.first ]]
+[[ arrayAccess["first"] ]]
+~~~
+
+Reason: `ArrayAccess`, `Traversable`, collections, models, proxies, and other PHP objects are not dot-traversable or indexable. A separately approved `<each>` iterable policy does not grant property or index traversal.
+
 ## 29. Ambiguities requiring a final decision
 
 The following questions remain open and require explicit approval before implementation:
@@ -1171,22 +1345,21 @@ The following questions remain open and require explicit approval before impleme
 2. Literal delimiter ergonomics: rely on HTML character references for visible [[ text, or add a verbatim element or escape sequence?
 3. Attribute detection: make [[ inside ordinary attribute values a hard error as proposed, or preserve it literally with a development warning?
 4. HTML strictness: reject omitted optional end tags and all mismatched ordinary HTML, or validate only Opia structural nesting and leave ordinary HTML recovery to browsers?
-5. Object data model: allow declared public properties as proposed, require arrays only, or define a dedicated template-data access contract?
-6. Function baseline: ship no built-ins, or standardize a minimal pure set such as count and format helpers?
-7. Equality: permit numeric comparison between integers and decimals as proposed, or require identical scalar types?
-8. Arithmetic: retain arithmetic operators, or keep version-one expressions limited to boolean and comparison operations?
-9. Iterable policy: permit every Traversable, or require arrays plus an explicit safe-iterable contract?
-10. Resource budgets: choose default limits for loop iterations, include depth, AST depth, output bytes, and function calls.
-11. Loop shadowing: reject every visible-name collision as proposed, or permit explicit lexical shadowing?
-12. Layout depth: keep one layout hop in version one, or specify nested layout slot forwarding now?
-13. Direct layout rendering: allow yields to use defaults without a page frame, or reject direct rendering of layout templates?
-14. Yield defaults: keep the default attribute as escaped plain text, or support fallback child fragments?
-15. Trusted HTML API: approve the capability's PHP contract, name, constructors, and sanitizer integration.
-16. Whitespace: enable standalone structural-line trimming by default, make it configurable, or preserve every source byte?
-17. Null and boolean output: retain strict output errors, or define canonical text rendering?
-18. Template roots: support one root only, or specify package namespaces and override order before 1.0?
-19. Component collision policy: decide whether future component names are case-sensitive and how they map to PHP classes or registries.
-20. Dynamic attribute policy: define URL schemes, boolean presence, class-token validation, and event-handler prohibition before enabling any reserved namespace.
+5. Function baseline: ship no built-ins, or standardize a minimal pure set such as count and format helpers?
+6. Equality: permit numeric comparison between integers and decimals as proposed, or require identical scalar types?
+7. Arithmetic: retain arithmetic operators, or keep version-one expressions limited to boolean and comparison operations?
+8. Iterable policy: permit every Traversable, or require arrays plus an explicit safe-iterable contract?
+9. Resource budgets: choose default limits for loop iterations, include depth, AST depth, output bytes, and function calls.
+10. Loop shadowing: reject every visible-name collision as proposed, or permit explicit lexical shadowing?
+11. Layout depth: keep one layout hop in version one, or specify nested layout slot forwarding now?
+12. Direct layout rendering: allow yields to use defaults without a page frame, or reject direct rendering of layout templates?
+13. Yield defaults: keep the default attribute as escaped plain text, or support fallback child fragments?
+14. Trusted HTML API: approve the capability's PHP contract, name, constructors, and sanitizer integration.
+15. Whitespace: enable standalone structural-line trimming by default, make it configurable, or preserve every source byte?
+16. Null and boolean output: retain strict output errors, or define canonical text rendering?
+17. Template roots: support one root only, or specify package namespaces and override order before 1.0?
+18. Component collision policy: decide whether future component names are case-sensitive and how they map to PHP classes or registries.
+19. Dynamic attribute policy: define URL schemes, boolean presence, class-token validation, and event-handler prohibition before enabling any reserved namespace.
 
 These are design risks, not missing implementation details. The language should not be declared stable until they are resolved.
 
@@ -1233,6 +1406,8 @@ No phase is implemented by this RFC.
 ### Phase 4: safe interpreter
 
 - strict value model;
+- array-only record traversal with object property access rejected before object state is observed;
+- PHP 8.4+ conformance fixtures proving hooked properties, lazy ghosts, and lazy proxies are rejected without invoking hooks, initializers, or proxy factories;
 - HTML text escaping;
 - undefined and null errors;
 - condition evaluation;
@@ -1281,4 +1456,3 @@ Separate RFCs must precede:
 - additional expression functions or operators.
 
 Components and dynamic attributes must not be implemented merely because their namespaces are reserved.
-
